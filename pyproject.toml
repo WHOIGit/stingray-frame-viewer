@@ -1,0 +1,30 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "stingray-frame-viewer"
+version = "0.1.0"
+description = "Web service that serves individual frames of Stingray towed-shadowgraph videos"
+requires-python = ">=3.10"
+dependencies = [
+    "pydantic>=2.0",
+    "pydantic-settings>=2.0",
+    "pyarrow>=14.0",
+    "numpy",
+    "opencv-python-headless",
+    "polars",
+    "amplify-db-utils",
+    "amplify-storage-utils[s3]",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/stingray_frame_viewer"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
