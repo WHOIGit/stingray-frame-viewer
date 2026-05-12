@@ -5,7 +5,8 @@ Usage:
 
 Reads the file with cv2.VideoCapture and prints frame count, reported FPS,
 container-reported width/height, and the dtype/shape/channel layout of the
-first decoded frame. Used once during M1 (DESIGN §7 bit-depth confirmation).
+first decoded frame. Used to confirm the source AVI bit-depth assumption
+recorded in ``src/stingray_frame_viewer/extractor.py``.
 """
 from __future__ import annotations
 

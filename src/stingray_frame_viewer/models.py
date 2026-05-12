@@ -1,7 +1,7 @@
 """Pydantic models for the manifest tables.
 
-``Video`` is one row per video; ``Frame`` is one row per frame. Schemas locked
-in DESIGN §6. Datetimes are tz-aware UTC. The source CSV is naive
+``Video`` is one row per video; ``Frame`` is one row per frame. Schemas
+locked in DESIGN.md. Datetimes are tz-aware UTC. The source CSV is naive
 (``media_time`` arrives as ``"2024-05-03 19:11:12.333"`` with no offset, but
 the trailing ``Z`` on filename timestamps confirms UTC intent), and DuckDB's
 parquet round-trip silently re-interprets naive timestamps through the local

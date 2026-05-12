@@ -2,11 +2,11 @@
 
 Web service that serves individual frames of Stingray (towed shadowgraph imager) videos to browsers. Sits in front of source AVIs, encodes frames on demand, and (Phase 2+) caches encoded frames in VAST S3.
 
-Full design: [stingray-frame-viewer-DESIGN.md](stingray-frame-viewer-DESIGN.md). Library background: [stingray-frame-viewer-CONTEXT.md](stingray-frame-viewer-CONTEXT.md).
+Design overview: [DESIGN.md](DESIGN.md).
 
 ## Status
 
-This repo is being built in milestones (DESIGN §16). M0–M2 are the foundation: scaffold, AVI inspection script, manifest models, and the CSV ingest CLI. HTTP routes (M3+) are not yet implemented.
+Foundations only: project scaffold, the AVI inspection script, the manifest models, and the CSV ingest CLI. Frame extraction, encoding, the HTTP routes, and the S3 cache are described in [DESIGN.md](DESIGN.md) §3 and are not yet implemented.
 
 ## Install (development)
 

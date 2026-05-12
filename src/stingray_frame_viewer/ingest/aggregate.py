@@ -16,7 +16,7 @@ def parse_cruise_camera(media_path: str) -> tuple[str, str]:
     """Extract ``(cruise, camera)`` from a Stingray ``media_path``.
 
     Stingray paths follow ``/proj/nes-lter/Stingray/data/{cruise}/{camera}/{ts}/{file}.avi``
-    (DESIGN §4). We anchor on the literal ``"Stingray"`` segment so the parser
+    (see DESIGN.md). We anchor on the literal ``"Stingray"`` segment so the parser
     works regardless of mount-point prefix.
     """
     parts = Path(media_path).parts
@@ -88,7 +88,7 @@ def aggregate_videos(csv_paths: Iterable[str | Path]) -> pl.DataFrame:
 
 
 def aggregate_frames(csv_paths: Iterable[str | Path]) -> pl.DataFrame:
-    """One row per frame, sorted for parquet range pruning (DESIGN §6).
+    """One row per frame, sorted for parquet range pruning (see DESIGN.md).
 
     Bad-file sentinel rows are dropped (see ``_scan_ok_frames``).
     """
@@ -109,7 +109,7 @@ def aggregate_frames(csv_paths: Iterable[str | Path]) -> pl.DataFrame:
 def count_id_link_nonempty(csv_paths: Iterable[str | Path]) -> int:
     """How many rows have non-empty ``id`` or ``link``? Zero is the expected case.
 
-    DESIGN §4 says these columns are empty today; non-zero is a design-trigger
+    DESIGN.md says these columns are empty today; non-zero is a design-trigger
     warning. Returns 0 if the columns are absent (older CSVs).
     """
     schema_names = _scan(csv_paths).collect_schema().names()

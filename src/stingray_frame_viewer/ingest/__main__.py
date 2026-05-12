@@ -76,7 +76,7 @@ def main(argv: list[str] | None = None) -> int:
     if nonempty:
         print(
             f"WARNING: {nonempty} rows have non-empty id/link "
-            "(DESIGN §4 says these are empty today — escalate)",
+            "(DESIGN.md says these are empty today — escalate)",
             file=sys.stderr,
         )
 

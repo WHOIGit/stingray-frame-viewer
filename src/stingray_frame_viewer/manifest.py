@@ -1,7 +1,7 @@
 """amplify-db-utils wrapper for the manifest layer.
 
 The manifest is the index of which videos exist, where they live on disk, and
-how many frames each has (DESIGN §6). At service startup the videos table is
+how many frames each has (see DESIGN.md). At service startup the videos table is
 read into an in-memory ``{video_id: Video}`` dict; per-request lookups are
 plain dict access. There is no per-request database call.
 """

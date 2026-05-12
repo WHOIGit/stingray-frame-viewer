@@ -12,3 +12,7 @@ build/
 venv/
 .DS_Store
 data/
+
+# Internal design / context notes — not for the public repo
+stingray-frame-viewer-DESIGN.md
+stingray-frame-viewer-CONTEXT.md

@@ -1,9 +1,9 @@
 """FastAPI route handlers.
 
-Endpoints (DESIGN §5): ``GET /health``, ``GET /videos/{video_id}``,
+Endpoints (see DESIGN.md): ``GET /health``, ``GET /videos/{video_id}``,
 ``GET /frames/{video_id}/{frame_index}``, and ``GET
 /frames/{video_id}/{frame_index}/neighbors`` (M6). Handlers are sync ``def``
-so FastAPI runs them in its threadpool (DESIGN §11).
+so FastAPI runs them in its threadpool.
 
 Implemented in M4.
 """

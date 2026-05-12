@@ -22,5 +22,5 @@ from __future__ import annotations
 #
 # Implication for extractor: cv2.VideoCapture.read() returns (H, W, 3) uint8.
 # Convert with cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) to get (H, W) uint8 before
-# encoding. Seek via cv2.CAP_PROP_POS_FRAMES is safe (DESIGN §7).
+# encoding. Seek via cv2.CAP_PROP_POS_FRAMES is safe (see DESIGN.md).
 # ------------------------------------------------------------------------------
