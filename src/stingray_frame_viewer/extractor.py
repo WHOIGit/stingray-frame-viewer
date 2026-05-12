@@ -1,12 +1,12 @@
 """OpenCV-based AVI frame extraction.
 
-Public surface (M3): ``extract_frame(media_path: str, frame_index: int) -> np.ndarray``
+Public surface: ``extract_frame(media_path: str, frame_index: int) -> np.ndarray``
 returning a 2D uint8 grayscale array. Uses ``cv2.CAP_PROP_POS_FRAMES``, which
 is reliable on Stingray AVIs because they are uncompressed (every frame is a
 keyframe).
 
-Implemented in M3. The comment block below records the ground truth measured
-by ``scripts/inspect_avi.py`` so future readers don't have to re-derive it.
+The comment block below records the ground truth measured by
+``scripts/inspect_avi.py`` so future readers don't have to re-derive it.
 """
 from __future__ import annotations
 
@@ -24,3 +24,42 @@ from __future__ import annotations
 # Convert with cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) to get (H, W) uint8 before
 # encoding. Seek via cv2.CAP_PROP_POS_FRAMES is safe (see DESIGN.md).
 # ------------------------------------------------------------------------------
+
+from pathlib import Path
+
+import cv2
+import numpy as np
+
+from .errors import FrameExtractionError
+
+
+def extract_frame(media_path: str, frame_index: int) -> np.ndarray:
+    """Decode a single grayscale frame from a Stingray AVI.
+
+    Returns a 2D uint8 array. Raises :class:`FrameExtractionError` if the
+    file is missing, cannot be opened, or the frame cannot be decoded. The
+    caller is responsible for bounds-checking ``frame_index`` against the
+    manifest's ``frame_count`` — out-of-range requests should be turned into
+    416 responses by the route layer before reaching the extractor.
+    """
+    if not Path(media_path).is_file():
+        raise FrameExtractionError(f"source AVI not found: {media_path}")
+
+    cap = cv2.VideoCapture(media_path)
+    if not cap.isOpened():
+        raise FrameExtractionError(f"could not open AVI: {media_path}")
+
+    try:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, float(frame_index))
+        ok, frame = cap.read()
+    finally:
+        cap.release()
+
+    if not ok or frame is None:
+        raise FrameExtractionError(
+            f"could not decode frame {frame_index} from {media_path}"
+        )
+
+    if frame.ndim == 3:
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    return frame
