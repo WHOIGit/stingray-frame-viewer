@@ -16,8 +16,8 @@ dependencies = [
     "polars",
     "fastapi>=0.110",
     "uvicorn[standard]>=0.27",
-    "amplify-db-utils",
-    "amplify-storage-utils[s3]",
+    "amplify-db-utils @ git+https://github.com/WHOIGit/amplify-db-utils.git",
+    "amplify-storage-utils[s3] @ git+https://github.com/WHOIGit/amplify-storage-utils.git",
 ]
 
 [project.optional-dependencies]
@@ -25,6 +25,9 @@ dev = [
     "pytest>=8.0",
     "httpx>=0.27",
 ]
+
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/stingray_frame_viewer"]
