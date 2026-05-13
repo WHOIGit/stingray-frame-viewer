@@ -6,38 +6,49 @@ Design overview: [DESIGN.md](DESIGN.md).
 
 ## Status
 
-Foundations only: project scaffold, the AVI inspection script, the manifest models, and the CSV ingest CLI. Frame extraction, encoding, the HTTP routes, and the S3 cache are described in [DESIGN.md](DESIGN.md) §3 and are not yet implemented.
+Phase 1 (on-the-fly extraction) works end-to-end: manifest ingest, frame extraction, PNG/JPEG encoding, and the public HTTP contract are all implemented and tested. The Phase 2 VAST S3 cache, the `/neighbors` endpoint, and the bulk backfill are still to come — see [DESIGN.md](DESIGN.md) §3.
 
 ## Install (development)
 
-The service depends on two sibling libraries that are typically iterated alongside it. Install those editably first, then install this repo editably:
-
 ```bash
-pip install -e ../amplify-db-utils
-pip install -e "../amplify-storage-utils[s3]"
-pip install -e ".[dev]"
+python3 -m venv .venv
+.venv/bin/pip install -e ".[dev]"
 ```
 
-Adjust the sibling paths to match your checkout layout.
+The `amplify-db-utils` and `amplify-storage-utils` dependencies are pinned to their git repositories in [pyproject.toml](pyproject.toml); pip resolves them automatically. No separate editable installs of sibling checkouts are required.
 
 ## Test
 
 ```bash
-pytest
+.venv/bin/pytest
 ```
+
+## Run the service
+
+```bash
+STINGRAY_STORE_ROOT=./.dev-store \
+  .venv/bin/uvicorn stingray_frame_viewer.app:create_app --factory --port 8000
+```
+
+Then:
+
+- `curl http://localhost:8000/health` → `{"status":"ok"}`
+- `curl http://localhost:8000/videos/<video_id>` → JSON metadata
+- `curl -o frame.png http://localhost:8000/frames/<video_id>/0` → PNG (default)
+- `curl -o frame.jpg http://localhost:8000/frames/<video_id>/0?format=jpeg` → JPEG
 
 ## Inspect a sample AVI
 
 ```bash
-python scripts/inspect_avi.py /path/to/sample.avi
+.venv/bin/python scripts/inspect_avi.py /path/to/sample.avi
 ```
 
-Prints dimensions, dtype, channel count, and total frame count. Used once during M1 to confirm Stingray AVIs are 8-bit grayscale before extractor code is written.
+Prints dimensions, dtype, channel count, and total frame count. Used once during initial bring-up to confirm Stingray AVIs are 8-bit grayscale; the measured values are recorded as a comment block at the top of [src/stingray_frame_viewer/extractor.py](src/stingray_frame_viewer/extractor.py).
 
 ## Ingest a cruise's CSVs
 
 ```bash
-python -m stingray_frame_viewer.ingest \
+.venv/bin/python -m stingray_frame_viewer.ingest \
     --csv "/path/to/cruise/*.csv" \
     --store-root ./.dev-store \
     [--frames]
@@ -47,4 +58,4 @@ The ingest CLI is append-only and refuses to write to a `(cruise, camera)` parti
 
 ## Env vars
 
-See [.env.example](.env.example). The ingest CLI honors `STINGRAY_STORE_ROOT` as a fallback for `--store-root`.
+See [.env.example](.env.example). The ingest CLI honors `STINGRAY_STORE_ROOT` as a fallback for `--store-root`; the service requires it.

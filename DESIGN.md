@@ -55,7 +55,7 @@ URLs are stable; the storage backend behind them can change without breaking cli
 | `GET /frames/{video_id}/{frame_index}?format=png\|jpeg` | Encoded frame bytes. Defaults to PNG (lossless). Sends `Cache-Control: public, max-age=31536000, immutable`. `404` if `video_id` unknown; `416` if frame index out of range. |
 | `GET /videos/{video_id}` | Video-level JSON metadata for client-side display and scrubbing. The on-disk path is internal and not exposed. |
 | `GET /frames/{video_id}/{frame_index}/neighbors` | Prefetch hints for snappy scrubbing (prev/next ±1, ±5). |
-| `GET /health` | Liveness; returns `503` until the manifest has loaded into memory. |
+| `GET /health` | Liveness; `200 {"status": "ok"}` once the service is accepting requests. uvicorn's lifespan startup blocks the listen socket until the manifest is loaded, so no separate readiness gate is needed. |
 
 PNG is the default and is always lossless. JPEG is permitted but only the viewer UI should use it; annotation pipelines always request PNG.
 
@@ -116,9 +116,9 @@ Authentication (deferred to a reverse proxy); singleflight / coalesced extractio
 
 ## 2. Existing
 
-What is currently implemented in this repo:
+What is currently implemented in this repo. Phase 1 (on-the-fly extraction) is end-to-end functional.
 
-**Project scaffold:** [pyproject.toml](pyproject.toml), [.env.example](.env.example), [.gitignore](.gitignore), and a `pytest` setup. The `amplify-db-utils` and `amplify-storage-utils` siblings are intended to be installed editably; see [README.md](README.md) for the order.
+**Project scaffold.** [pyproject.toml](pyproject.toml), [.env.example](.env.example), [.gitignore](.gitignore), `pytest` setup. The `amplify-db-utils` and `amplify-storage-utils` dependencies are pinned to their git repositories (resolved by pip at install time); `tool.hatch.metadata.allow-direct-references = true` enables the direct URLs under hatchling.
 
 **Manifest layer.** [src/stingray_frame_viewer/models.py](src/stingray_frame_viewer/models.py) defines the `Video` and `Frame` pydantic models with the schemas above. [src/stingray_frame_viewer/manifest.py](src/stingray_frame_viewer/manifest.py) wraps `amplify-db-utils`:
 
@@ -136,7 +136,30 @@ What is currently implemented in this repo:
 
 **AVI inspection script.** [scripts/inspect_avi.py](scripts/inspect_avi.py) reads a sample AVI with OpenCV and prints dimensions, dtype, channel layout, and frame count. The measured ground truth is recorded as a comment block in [src/stingray_frame_viewer/extractor.py](src/stingray_frame_viewer/extractor.py) so future readers don't have to re-derive it.
 
-**Test suite.** [tests/](tests/) — unit tests for the manifest round-trip, the partition-conflict check, the CSV path parser, the polars aggregation (including the `bad_file` skip), and the `id`/`link` warning logic.
+**Frame extraction.** [src/stingray_frame_viewer/extractor.py](src/stingray_frame_viewer/extractor.py) — `extract_frame(media_path, frame_index) -> np.ndarray` returns a 2D uint8 grayscale array. Uses `cv2.VideoCapture` with `CAP_PROP_POS_FRAMES` (reliable on uncompressed AVI) and converts BGR-broadcast frames to single-channel grayscale. Raises `FrameExtractionError` for missing files, unopenable containers, and decode failures.
+
+**Encoding.** [src/stingray_frame_viewer/encoder.py](src/stingray_frame_viewer/encoder.py) — `encode(frame, fmt, jpeg_quality=90) -> bytes` wraps `cv2.imencode`. PNG is lossless and the default; JPEG is opt-in. Unknown formats raise `ValueError` (mapped to 400 at the route layer); `cv2.imencode` failure raises `FrameExtractionError`.
+
+**Domain errors.** [src/stingray_frame_viewer/errors.py](src/stingray_frame_viewer/errors.py) defines `VideoNotFoundError`, `FrameOutOfRangeError`, and `FrameExtractionError`. The exceptions carry useful identifiers (`video_id`, `frame_index`, `frame_count`) on their bodies. `install_handlers(app)` registers FastAPI exception handlers that map them to 404 / 416 / 500 JSON responses.
+
+**Configuration.** [src/stingray_frame_viewer/config.py](src/stingray_frame_viewer/config.py) — pydantic-settings `Settings` class with `STINGRAY_` env prefix. Reads from environment or `.env` file. `extra="ignore"` keeps the schema forward-compatible.
+
+**HTTP service.** [src/stingray_frame_viewer/app.py](src/stingray_frame_viewer/app.py) defines `create_app()`. The async lifespan loads the manifest and pins it on `app.state.manifest`. [src/stingray_frame_viewer/routes.py](src/stingray_frame_viewer/routes.py) implements three endpoints with sync `def` handlers:
+
+- `GET /health` returns `{"status": "ok"}`.
+- `GET /videos/{video_id}` returns `{video_id, media_basename, frame_count, last_frame_index, media_time, cruise, camera}`. The on-disk `media_path` stays internal.
+- `GET /frames/{video_id}/{frame_index}?format=png|jpeg` extracts on the fly, encodes, and returns the bytes with `Cache-Control: public, max-age=31536000, immutable` and the matching `Content-Type`. 400 on bad format, 404 on unknown video, 416 on out-of-range frame, 500 on extraction failure.
+
+The manifest, settings, and ready flag are exposed to handlers via tiny `Depends` shims so tests can override them with `app.dependency_overrides`.
+
+Run with:
+
+```bash
+STINGRAY_STORE_ROOT=./.dev-store \
+  uvicorn stingray_frame_viewer.app:create_app --factory
+```
+
+**Test suite.** [tests/](tests/) — 34 unit and integration tests covering: manifest round-trip; partition-conflict check; CSV path parser; polars aggregation including the `bad_file` skip; id/link warning logic; extractor seek/decode/error paths against a synthetic FFV1 AVI fixture; PNG byte-exact and JPEG approximate round-trips; all five route endpoints (status codes, headers, body byte-equality against the encoder output).
 
 ---
 
@@ -144,15 +167,9 @@ What is currently implemented in this repo:
 
 What is planned but not yet built:
 
-**Frame extraction.** [src/stingray_frame_viewer/extractor.py](src/stingray_frame_viewer/extractor.py) — OpenCV `VideoCapture` seek + decode, returning a 2D uint8 grayscale `np.ndarray`. Module skeleton with the measured AVI parameters is in place; the function is not.
+**S3 cache layer.** [src/stingray_frame_viewer/cache.py](src/stingray_frame_viewer/cache.py) — `probe / get / put` against `amplify-storage-utils` for VAST S3. Behind the `STINGRAY_CACHE_ENABLED` config flag so Phase 1 (no cache) and Phase 2 (lazy write-through) are selectable with a single switch. Response `Content-Type` is derived from the cache-key extension at serve time (the storage abstraction does not surface a content-type on `put`).
 
-**Encoding.** [src/stingray_frame_viewer/encoder.py](src/stingray_frame_viewer/encoder.py) — `cv2.imencode` wrappers for PNG (lossless default) and JPEG (opt-in).
-
-**HTTP service.** [src/stingray_frame_viewer/app.py](src/stingray_frame_viewer/app.py), [src/stingray_frame_viewer/routes.py](src/stingray_frame_viewer/routes.py), [src/stingray_frame_viewer/config.py](src/stingray_frame_viewer/config.py), [src/stingray_frame_viewer/errors.py](src/stingray_frame_viewer/errors.py) — the FastAPI app with the routes described in §1, a `pydantic-settings` configuration object, and the exception → HTTP-status mapping. `/health` gates on manifest readiness.
-
-**S3 cache layer.** [src/stingray_frame_viewer/cache.py](src/stingray_frame_viewer/cache.py) — `probe / get / put` against `amplify-storage-utils` for VAST S3. Behind a config flag so Phase 1 (no cache) and Phase 2 (lazy write-through) are selectable with a single switch. Response `Content-Type` is derived from the cache-key extension at serve time (the storage abstraction does not surface a content-type on `put`).
-
-**Neighbor hints.** `GET /frames/{video_id}/{frame_index}/neighbors` — returns prefetch URLs for adjacent frames; useful for snappy scrubbing.
+**Neighbor hints.** `GET /frames/{video_id}/{frame_index}/neighbors` — returns prefetch URLs for adjacent frames; useful for snappy scrubbing. The window is already configurable via `STINGRAY_NEIGHBOR_WINDOW`.
 
 **Per-frame table.** Construction of the `frames` table is supported by the ingest CLI today but not yet consumed. It is the entry point for status-aware skipping and per-frame wall-clock timestamps if a future viewer feature needs them.
 
@@ -161,3 +178,7 @@ What is planned but not yet built:
 **Auth.** Bearer-token auth at a reverse proxy in front of the service.
 
 **Substrate migration.** When a shared imaging-instrument data substrate is ready to host Stingray bytes, the public URL contract does not change. The cache module is the migration surface; designing it with a clean interface is the only thing that needs to happen now to keep that migration cheap.
+
+**Structured logging.** One log line per request (video_id, frame_index, format, cache hit/miss, duration) — useful for understanding access patterns once the cache lands.
+
+**Open-`VideoCapture` LRU.** Seek time on uncompressed AVI grows linearly with `frame_index` (≈3 ms / frame on the sample file). A bounded LRU of open `VideoCapture` handles keyed by `media_path` would amortize this for sequential scrubbing. Not needed at prototype scale.
