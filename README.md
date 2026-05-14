@@ -51,8 +51,11 @@ Prints dimensions, dtype, channel count, and total frame count. Used once during
 .venv/bin/python -m stingray_frame_viewer.ingest \
     --csv "/path/to/cruise/*.csv" \
     --store-root ./.dev-store \
+    [--exclude "*_fast.csv"] \
     [--frames]
 ```
+
+`--csv` and `--exclude` are both repeatable. `--exclude` takes an `fnmatch` pattern tested against each CSV's full path (`*` spans `/`), so `--exclude "*_fast.csv"` drops fast-export variants and `--exclude "*/ISIIS2/20250418_AR88.csv"` drops one specific file without affecting same-named files in other directories.
 
 The ingest CLI is append-only and refuses to write to a `(cruise, camera)` partition that already exists in the manifest. Re-ingesting an existing cruise requires manually clearing the store and starting over.
 

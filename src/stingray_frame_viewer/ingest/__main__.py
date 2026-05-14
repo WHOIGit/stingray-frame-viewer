@@ -8,6 +8,7 @@ requires an out-of-band full reingest (no ``--overwrite`` flag by design).
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import glob
 import os
 import sys
@@ -33,6 +34,27 @@ def _expand_globs(patterns: list[str]) -> list[str]:
     return paths
 
 
+def _apply_excludes(
+    paths: list[str], patterns: list[str]
+) -> tuple[list[str], list[str]]:
+    """Split ``paths`` into (kept, dropped) by fnmatch against the full path.
+
+    Patterns are matched with ``fnmatch.fnmatchcase`` against each complete
+    path string — ``*`` spans ``/``, so ``*_fast.csv`` matches any file ending
+    that way, and ``*/ISIIS2/*`` excludes a whole subdirectory.
+    """
+    if not patterns:
+        return paths, []
+    kept: list[str] = []
+    dropped: list[str] = []
+    for p in paths:
+        if any(fnmatch.fnmatchcase(p, pat) for pat in patterns):
+            dropped.append(p)
+        else:
+            kept.append(p)
+    return kept, dropped
+
+
 def _existing_partitions(store) -> set[tuple[str, str]]:
     rows = store.distinct_values("videos", ["cruise", "camera"])
     return {(r["cruise"], r["camera"]) for r in rows}
@@ -48,6 +70,14 @@ def main(argv: list[str] | None = None) -> int:
         action="append",
         required=True,
         help="Glob matching one or more CSV files (may be repeated).",
+    )
+    parser.add_argument(
+        "--exclude",
+        action="append",
+        default=[],
+        metavar="PATTERN",
+        help="fnmatch pattern tested against each CSV path; matching files are "
+        "skipped (may be repeated). Example: --exclude '*_fast.csv'",
     )
     parser.add_argument(
         "--store-root",
@@ -68,6 +98,15 @@ def main(argv: list[str] | None = None) -> int:
     csv_paths = _expand_globs(args.csv)
     if not csv_paths:
         print("ERROR: no CSV files matched the supplied glob(s)", file=sys.stderr)
+        return 1
+
+    csv_paths, excluded = _apply_excludes(csv_paths, args.exclude)
+    if excluded:
+        print(f"excluding {len(excluded)} file(s) matching --exclude:", file=sys.stderr)
+        for p in excluded:
+            print(f"  {p}", file=sys.stderr)
+    if not csv_paths:
+        print("ERROR: no CSV files left after applying --exclude", file=sys.stderr)
         return 1
 
     print(f"reading {len(csv_paths)} csv file(s)", file=sys.stderr)
