@@ -36,18 +36,26 @@ services:
       # Manifest store (read-write). The service reads at startup; the
       # ingest CLI writes when you run it (see operational notes below).
       # Persistent across container restarts — back this up.
-      - ./manifest:/var/stingray/manifest:rw
-
-      # Source AVIs. Read-only is plenty — the service never writes.
       #
-      # IMPORTANT: the mount target *inside* the container must match the
-      # `media_path` values stored in the manifest verbatim. The ingest
-      # records whatever path the CSV contains; the service later hands
-      # that exact string to OpenCV. If your CSVs contain
-      # `/proj/nes-lter/Stingray/data/...`, mount the host's data root at
-      # `/proj/nes-lter/Stingray` inside the container — anywhere else
-      # will break frame extraction with a 500.
-      - /proj/nes-lter/Stingray:/proj/nes-lter/Stingray:ro
+      # Host path comes from STINGRAY_MANIFEST_HOST_DIR (set it in a `.env`
+      # file next to this compose file, or export it in the shell). Falls
+      # back to ./manifest for local dev. The container-side path is fixed
+      # and must match STINGRAY_STORE_ROOT above.
+      - ${STINGRAY_MANIFEST_HOST_DIR:-./manifest}:/var/stingray/manifest:rw
+
+      # Source AVIs, read-only — the service never writes them.
+      #
+      # Host path comes from STINGRAY_AVI_HOST_DIR (required; compose will
+      # refuse to start if it is unset).
+      #
+      # IMPORTANT: the container-side path is NOT a host path and is NOT an
+      # env var on purpose — it must match the `media_path` values stored in
+      # the manifest verbatim. The ingest records whatever path the CSV
+      # contains; the service later hands that exact string to OpenCV. The
+      # CSVs contain `/proj/nes-lter/Stingray/data/...`, so the container
+      # target is hardcoded to `/proj/nes-lter/Stingray/data`. Only the host
+      # side (where that data actually lives on this machine) varies.
+      - ${STINGRAY_AVI_HOST_DIR:?set STINGRAY_AVI_HOST_DIR to the host path of the Stingray data root}:/proj/nes-lter/Stingray/data:ro
 
 # Operational notes
 # -----------------
