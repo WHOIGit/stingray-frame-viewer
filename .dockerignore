@@ -1,0 +1,22 @@
+# Large local state — excluding these is what the build context transfer
+# actually cares about.
+.venv/
+.git/
+data/
+.dev-store/
+.smoke-store/
+
+# Local caches that can accumulate during dev.
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Tests aren't needed at runtime. Drop this line (or use `docker compose
+# run --rm stingray-frame-viewer pytest`) if you want them in the image.
+tests/
+
+# Never bake secrets into an image.
+.env
+
+# macOS Finder metadata — created anywhere the src tree is browsed.
+.DS_Store

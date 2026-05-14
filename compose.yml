@@ -1,0 +1,68 @@
+# Example single-container compose deployment. Not for production.
+# A reverse proxy (nginx, traefik, etc.) will sit in front of this service
+# once it ships; the port mapping below binds to localhost only on purpose
+# so the service is not exposed to the network until then.
+
+services:
+  stingray-frame-viewer:
+    build: .
+    image: stingray-frame-viewer:latest
+    restart: unless-stopped
+
+    ports:
+      # host:container — bind to 127.0.0.1 so only the host (and an
+      # eventual reverse proxy on the same host) can reach the service.
+      # Change to "8000:8000" if you need the port reachable from elsewhere
+      # on the network during development.
+      - "127.0.0.1:8000:8000"
+
+    environment:
+      # Path *inside the container* where the manifest store lives.
+      # Must match the mount target under `volumes` below.
+      STINGRAY_STORE_ROOT: /var/stingray/manifest
+
+      # Defaults — uncomment / change to override.
+      # STINGRAY_DEFAULT_FORMAT: png
+      # STINGRAY_JPEG_QUALITY: "90"
+
+      # Phase-2 cache settings (not yet consumed by the service code).
+      # STINGRAY_CACHE_ENABLED: "false"
+      # STINGRAY_CACHE_BUCKET: ""
+      # STINGRAY_CACHE_S3_ENDPOINT: ""
+      # STINGRAY_CACHE_S3_ACCESS_KEY: ""
+      # STINGRAY_CACHE_S3_SECRET_KEY: ""
+
+    volumes:
+      # Manifest store (read-write). The service reads at startup; the
+      # ingest CLI writes when you run it (see operational notes below).
+      # Persistent across container restarts — back this up.
+      - ./manifest:/var/stingray/manifest:rw
+
+      # Source AVIs. Read-only is plenty — the service never writes.
+      #
+      # IMPORTANT: the mount target *inside* the container must match the
+      # `media_path` values stored in the manifest verbatim. The ingest
+      # records whatever path the CSV contains; the service later hands
+      # that exact string to OpenCV. If your CSVs contain
+      # `/proj/nes-lter/Stingray/data/...`, mount the host's data root at
+      # `/proj/nes-lter/Stingray` inside the container — anywhere else
+      # will break frame extraction with a 500.
+      - /proj/nes-lter/Stingray:/proj/nes-lter/Stingray:ro
+
+# Operational notes
+# -----------------
+# Ingest a cruise's CSVs into the manifest mounted above:
+#
+#   docker compose run --rm stingray-frame-viewer \
+#       python -m stingray_frame_viewer.ingest \
+#           --csv "/path/to/cruise/*.csv" \
+#           --store-root /var/stingray/manifest \
+#           --frames
+#
+# (If the CSVs live on the host, add another volume mount for them too,
+# or copy them into the manifest directory before running.)
+#
+# Watch logs:    docker compose logs -f stingray-frame-viewer
+# Smoke check:   curl http://127.0.0.1:8000/health
+# Restart:       docker compose restart stingray-frame-viewer
+# Stop:          docker compose down
