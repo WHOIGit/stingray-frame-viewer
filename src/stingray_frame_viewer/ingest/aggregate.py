@@ -24,19 +24,21 @@ _ENGINE = "streaming"
 def parse_cruise_camera(media_path: str) -> tuple[str, str]:
     """Extract ``(cruise, camera)`` from a Stingray ``media_path``.
 
-    Stingray paths follow ``/proj/nes-lter/Stingray/data/{cruise}/{camera}/{ts}/{file}.avi``
-    (see DESIGN.md). We anchor on the literal ``"Stingray"`` segment so the parser
-    works regardless of mount-point prefix.
+    Stingray paths end in ``.../{cruise}/{camera}/{timestamp}/{file}.avi`` (see
+    DESIGN.md). Only that trailing structure is guaranteed — the prefix is just
+    wherever the AVIs happen to be mounted (``/proj/nes-lter/Stingray/data``,
+    ``/mnt/stingray_data``, etc.), so we index from the *end* rather than
+    anchoring on any fixed segment. This keeps ingest working for CSVs that
+    reference arbitrary mount roots.
     """
     parts = Path(media_path).parts
-    try:
-        anchor = parts.index("Stingray")
-    except ValueError as exc:
-        raise ValueError(f"media_path does not contain 'Stingray' segment: {media_path}") from exc
-    if anchor + 3 >= len(parts):
-        raise ValueError(f"media_path is too short to contain cruise/camera: {media_path}")
-    # anchor + 1 is "data", anchor + 2 is cruise, anchor + 3 is camera
-    return parts[anchor + 2], parts[anchor + 3]
+    # Need at least the final four segments: cruise/camera/timestamp/file.
+    if len(parts) < 4:
+        raise ValueError(
+            f"media_path is too short to contain cruise/camera/timestamp/file: {media_path}"
+        )
+    # ..., cruise=-4, camera=-3, timestamp=-2, file=-1
+    return parts[-4], parts[-3]
 
 
 def _scan(csv_paths: Iterable[str | Path]) -> pl.LazyFrame:
@@ -97,13 +99,13 @@ def aggregate_videos(csv_paths: Iterable[str | Path]) -> pl.DataFrame:
 
 
 # Polars expression mirroring ``parse_cruise_camera``'s cruise extraction:
-# anchor on the ``Stingray`` path segment, skip one segment (``data``), and
-# capture the next one (``cruise``). Kept in lockstep with the Python parser by
-# ``test_cruise_expr_matches_parser``. Unlike the parser this returns null on a
-# non-matching path rather than raising — safe here because ``aggregate_videos``
-# (always run first in the CLI) validates every path via ``parse_cruise_camera``
-# before the frames stage is reached.
-_CRUISE_PATTERN = r"Stingray/[^/]+/([^/]+)/"
+# cruise is the fourth path segment from the end (``.../cruise/camera/ts/file``).
+# Anchored to end-of-string so it is independent of the mount-point prefix, in
+# lockstep with the Python parser (``test_cruise_expr_matches_parser``). Unlike
+# the parser this returns null on a non-matching path rather than raising —
+# safe here because ``aggregate_videos`` (always run first in the CLI) validates
+# every path via ``parse_cruise_camera`` before the frames stage is reached.
+_CRUISE_PATTERN = r"([^/]+)/[^/]+/[^/]+/[^/]+$"
 
 
 def _frames_lazy(csv_paths: Iterable[str | Path]) -> pl.LazyFrame:

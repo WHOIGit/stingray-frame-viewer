@@ -82,6 +82,8 @@ def test_cruise_expr_matches_parser():
         _path("NESLTER_AR99", "Cam1", "v"),
         _path("NESLTER_EN688", "Basler_avA2300-25gm", "vid"),
         "/some/other/prefix/Stingray/data/CRUISE_X/CamZ/20260101T000000.000Z/f.avi",
+        # Arbitrary mount root, no "Stingray" segment (regression: prefix-agnostic).
+        "/mnt/stingray_data/CRUISE_Y/CamW/20260101T000000.000Z/g.avi",
     ]
     via_expr = (
         pl.DataFrame({"media_path": paths})
