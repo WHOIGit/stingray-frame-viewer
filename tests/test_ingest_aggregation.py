@@ -71,6 +71,51 @@ def test_aggregate_frames_sorted(sample_csv):
     assert frame_indices == [0, 1, 2, 0, 1]
 
 
+def test_cruise_expr_matches_parser():
+    """The Polars cruise regex must agree with parse_cruise_camera (they are
+    two encodings of the same path contract; this guards them from drifting)."""
+    import polars as pl
+
+    from stingray_frame_viewer.ingest.aggregate import _CRUISE_PATTERN, parse_cruise_camera
+
+    paths = [
+        _path("NESLTER_AR99", "Cam1", "v"),
+        _path("NESLTER_EN688", "Basler_avA2300-25gm", "vid"),
+        "/some/other/prefix/Stingray/data/CRUISE_X/CamZ/20260101T000000.000Z/f.avi",
+    ]
+    via_expr = (
+        pl.DataFrame({"media_path": paths})
+        .select(pl.col("media_path").str.extract(_CRUISE_PATTERN, 1).alias("cruise"))["cruise"]
+        .to_list()
+    )
+    via_parser = [parse_cruise_camera(p)[0] for p in paths]
+    assert via_expr == via_parser
+
+
+def test_iter_frame_chunks_one_cruise_at_a_time(tmp_path):
+    """Chunked frames cover the same rows as aggregate_frames, partitioned by
+    cruise and sorted within each chunk."""
+    from stingray_frame_viewer.ingest.aggregate import iter_frame_chunks
+
+    a = _path("CRUISE_A", "Cam1", "va")
+    b = _path("CRUISE_B", "Cam1", "vb")
+    rows = [
+        _row(a, "va", "2026-01-13 19:30:07.771", 1, "2026-01-13 19:30:07.904"),
+        _row(a, "va", "2026-01-13 19:30:07.771", 0, "2026-01-13 19:30:07.837"),
+        _row(b, "vb", "2026-01-13 19:31:00.000", 0, "2026-01-13 19:31:00.066"),
+    ]
+    csv = _write_csv(tmp_path, "two_cruises.csv", rows)
+
+    chunks = dict(iter_frame_chunks([csv], ["CRUISE_A", "CRUISE_B"]))
+    assert set(chunks) == {"CRUISE_A", "CRUISE_B"}
+    # Each chunk holds only its cruise, sorted by (video_id, frame_index).
+    assert chunks["CRUISE_A"]["frame_index"].to_list() == [0, 1]
+    assert chunks["CRUISE_A"]["cruise"].unique().to_list() == ["CRUISE_A"]
+    assert chunks["CRUISE_B"]["frame_index"].to_list() == [0]
+    total = sum(c.height for c in chunks.values())
+    assert total == aggregate_frames([csv]).height
+
+
 def test_count_id_link_zero_when_empty(sample_csv):
     assert count_id_link_nonempty([sample_csv]) == 0
 

@@ -16,11 +16,11 @@ from pathlib import Path
 
 from ..manifest import ensure_frames_table, ensure_videos_table, open_store
 from .aggregate import (
-    aggregate_frames,
     aggregate_videos,
     count_bad_file_videos,
     count_id_link_nonempty,
     distinct_cruise_camera,
+    iter_frame_chunks,
 )
 
 
@@ -165,11 +165,19 @@ def main(argv: list[str] | None = None) -> int:
 
     frame_total = 0
     if args.frames:
-        # TODO(M7): full-corpus runs need chunking — to_arrow() materializes
-        # the whole frame in RAM. Fine for the per-cruise smoke test.
-        frames_df = aggregate_frames(csv_paths)
-        frame_total = frames_df.height
-        store.write("frames", frames_df.to_arrow())
+        # Write one cruise at a time so peak RAM is bounded to a single
+        # cruise's frames rather than the whole corpus (see iter_frame_chunks).
+        # Each cruise is a fresh `frames` partition (conflicts rejected above),
+        # so these appends never collide. Progress prints here matter: the
+        # frame write is the long pole on a full-corpus run.
+        frame_cruises = sorted({cruise for cruise, _ in partitions})
+        for cruise, chunk in iter_frame_chunks(csv_paths, frame_cruises):
+            store.write("frames", chunk.to_arrow())
+            frame_total += chunk.height
+            print(
+                f"  wrote frames cruise={cruise} frames={chunk.height}",
+                file=sys.stderr,
+            )
 
     for cruise, camera in partitions:
         subset = videos_df.filter(
