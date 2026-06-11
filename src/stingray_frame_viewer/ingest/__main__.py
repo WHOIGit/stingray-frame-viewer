@@ -10,8 +10,11 @@ from __future__ import annotations
 import argparse
 import fnmatch
 import glob
+import logging
 import os
 import sys
+import time
+from contextlib import contextmanager
 from pathlib import Path
 
 from ..manifest import ensure_frames_table, ensure_videos_table, open_store
@@ -23,13 +26,49 @@ from .aggregate import (
     iter_frame_chunks,
 )
 
+log = logging.getLogger("stingray_frame_viewer.ingest")
+
+
+def _configure_logging(verbose: bool) -> None:
+    """Attach a timestamped stderr handler to the ingest logger (idempotent).
+
+    Configures only this package's logger, not the root, so embedding the CLI
+    (or running it under pytest's caplog) doesn't clobber anyone else's logging.
+    ``--verbose`` drops the threshold to DEBUG, which adds per-file and
+    per-partition detail on top of the default per-phase INFO timeline.
+    """
+    log.setLevel(logging.DEBUG if verbose else logging.INFO)
+    if not log.handlers:
+        handler = logging.StreamHandler(sys.stderr)
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)-5s %(message)s", datefmt="%H:%M:%S")
+        )
+        log.addHandler(handler)
+    log.propagate = False
+
+
+@contextmanager
+def _phase(label: str):
+    """Log a phase boundary with wall-clock duration.
+
+    Each Stingray ingest phase is a full pass over every CSV (4.7M+ rows on a
+    cruise corpus), so emitting a start line and an elapsed-time end line is the
+    difference between "looks stuck" and "knowing the bad-file scan took 40s".
+    """
+    log.info("→ %s", label)
+    start = time.monotonic()
+    try:
+        yield
+    finally:
+        log.info("  %s (%.1fs)", label, time.monotonic() - start)
+
 
 def _expand_globs(patterns: list[str]) -> list[str]:
     paths: list[str] = []
     for pat in patterns:
         matches = sorted(glob.glob(pat))
         if not matches:
-            print(f"WARNING: glob matched no files: {pat}", file=sys.stderr)
+            log.warning("glob matched no files: %s", pat)
         paths.extend(matches)
     return paths
 
@@ -90,65 +129,86 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Aggregate and print a summary; do not write to the store.",
     )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Verbose (DEBUG) logging: per-file and per-partition detail.",
+    )
     args = parser.parse_args(argv)
+
+    _configure_logging(args.verbose)
+    run_start = time.monotonic()
 
     if not args.store_root:
         parser.error("--store-root is required (or set STINGRAY_STORE_ROOT)")
 
     csv_paths = _expand_globs(args.csv)
     if not csv_paths:
-        print("ERROR: no CSV files matched the supplied glob(s)", file=sys.stderr)
+        log.error("no CSV files matched the supplied glob(s)")
         return 1
 
     csv_paths, excluded = _apply_excludes(csv_paths, args.exclude)
     if excluded:
-        print(f"excluding {len(excluded)} file(s) matching --exclude:", file=sys.stderr)
+        log.info("excluding %d file(s) matching --exclude", len(excluded))
         for p in excluded:
-            print(f"  {p}", file=sys.stderr)
+            log.debug("  excluded: %s", p)
     if not csv_paths:
-        print("ERROR: no CSV files left after applying --exclude", file=sys.stderr)
+        log.error("no CSV files left after applying --exclude")
         return 1
 
-    print(f"reading {len(csv_paths)} csv file(s)", file=sys.stderr)
+    log.info(
+        "ingest start: %d csv file(s), store_root=%s, frames=%s, dry_run=%s",
+        len(csv_paths),
+        args.store_root,
+        args.frames,
+        args.dry_run,
+    )
+    for p in csv_paths:
+        log.debug("  csv: %s", p)
 
-    nonempty = count_id_link_nonempty(csv_paths)
+    with _phase("scan: id/link sanity check"):
+        nonempty = count_id_link_nonempty(csv_paths)
     if nonempty:
-        print(
-            f"WARNING: {nonempty} rows have non-empty id/link "
-            "(DESIGN.md says these are empty today — escalate)",
-            file=sys.stderr,
+        log.warning(
+            "%d rows have non-empty id/link (DESIGN.md says these are empty today — escalate)",
+            nonempty,
         )
 
-    bad_videos = count_bad_file_videos(csv_paths)
+    with _phase("scan: bad-file sentinels"):
+        bad_videos = count_bad_file_videos(csv_paths)
     if bad_videos:
-        print(
-            f"NOTE: skipping {bad_videos} video(s) flagged as unreadable in the CSV "
-            "(status='bad_file', no frame rows) — these are absent from the manifest",
-            file=sys.stderr,
+        log.info(
+            "skipping %d video(s) flagged unreadable in the CSV "
+            "(status='bad_file', no frame rows) — absent from the manifest",
+            bad_videos,
         )
 
-    videos_df = aggregate_videos(csv_paths)
-    partitions = distinct_cruise_camera(videos_df)
-    print(f"aggregated {videos_df.height} video(s) across {len(partitions)} partition(s)")
+    with _phase("aggregate: videos"):
+        videos_df = aggregate_videos(csv_paths)
+        partitions = distinct_cruise_camera(videos_df)
+    log.info(
+        "aggregated %d video(s) across %d partition(s)",
+        videos_df.height,
+        len(partitions),
+    )
+    for cruise, camera in partitions:
+        log.debug("  partition: cruise=%s camera=%s", cruise, camera)
 
-    store = open_store(args.store_root)
-    ensure_videos_table(store)
-    if args.frames:
-        ensure_frames_table(store)
+    with _phase("open store + ensure tables"):
+        store = open_store(args.store_root)
+        ensure_videos_table(store)
+        if args.frames:
+            ensure_frames_table(store)
 
-    existing = _existing_partitions(store)
+    with _phase("check existing partitions"):
+        existing = _existing_partitions(store)
     conflicts = sorted(set(partitions) & existing)
     if conflicts:
-        print(
-            "ERROR: refusing to write — these (cruise, camera) partitions already exist:",
-            file=sys.stderr,
-        )
+        log.error("refusing to write — these (cruise, camera) partitions already exist:")
         for cruise, camera in conflicts:
-            print(f"  cruise={cruise} camera={camera}", file=sys.stderr)
-        print(
-            "Re-ingest requires an out-of-band full reingest (the CLI is append-only).",
-            file=sys.stderr,
-        )
+            log.error("  cruise=%s camera=%s", cruise, camera)
+        log.error("Re-ingest requires an out-of-band full reingest (the CLI is append-only).")
         return 2
 
     if args.dry_run:
@@ -156,42 +216,37 @@ def main(argv: list[str] | None = None) -> int:
             subset = videos_df.filter(
                 (videos_df["cruise"] == cruise) & (videos_df["camera"] == camera)
             )
-            print(f"  [dry-run] cruise={cruise} camera={camera} videos={subset.height}")
-        print(f"done [dry-run]: {len(partitions)} partition(s), {videos_df.height} video(s)")
+            log.info("[dry-run] cruise=%s camera=%s videos=%d", cruise, camera, subset.height)
+        log.info(
+            "done [dry-run]: %d partition(s), %d video(s) in %.1fs",
+            len(partitions),
+            videos_df.height,
+            time.monotonic() - run_start,
+        )
         return 0
 
-    videos_arrow = videos_df.to_arrow()
-    store.write("videos", videos_arrow)
+    with _phase(f"write: videos table ({videos_df.height} rows)"):
+        store.write("videos", videos_df.to_arrow())
 
     frame_total = 0
     if args.frames:
         # Write one cruise at a time so peak RAM is bounded to a single
         # cruise's frames rather than the whole corpus (see iter_frame_chunks).
         # Each cruise is a fresh `frames` partition (conflicts rejected above),
-        # so these appends never collide. Progress prints here matter: the
-        # frame write is the long pole on a full-corpus run.
+        # so these appends never collide. This is the long pole on a full
+        # corpus, so each cruise gets its own timed phase.
         frame_cruises = sorted({cruise for cruise, _ in partitions})
+        log.info("writing frames for %d cruise(s)", len(frame_cruises))
         for cruise, chunk in iter_frame_chunks(csv_paths, frame_cruises):
-            store.write("frames", chunk.to_arrow())
+            with _phase(f"write: frames cruise={cruise} ({chunk.height} rows)"):
+                store.write("frames", chunk.to_arrow())
             frame_total += chunk.height
-            print(
-                f"  wrote frames cruise={cruise} frames={chunk.height}",
-                file=sys.stderr,
-            )
-
-    for cruise, camera in partitions:
-        subset = videos_df.filter(
-            (videos_df["cruise"] == cruise) & (videos_df["camera"] == camera)
-        )
-        msg = f"writing cruise={cruise} camera={camera} videos={subset.height}"
-        if args.frames:
-            msg += f" frames={int(subset['frame_count'].sum())}"
-        print(msg)
 
     summary = f"done: {len(partitions)} partition(s), {videos_df.height} video(s)"
     if args.frames:
         summary += f", {frame_total} frame(s)"
-    print(summary)
+    summary += f" in {time.monotonic() - run_start:.1f}s"
+    log.info(summary)
     return 0
 
 
