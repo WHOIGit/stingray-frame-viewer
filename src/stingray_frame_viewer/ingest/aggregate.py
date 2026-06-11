@@ -87,23 +87,71 @@ def aggregate_videos(csv_paths: Iterable[str | Path]) -> pl.DataFrame:
     ).select(["video_id", "media_path", "frame_count", "media_time", "cruise", "camera"])
 
 
-def aggregate_frames(csv_paths: Iterable[str | Path]) -> pl.DataFrame:
-    """One row per frame, sorted for parquet range pruning (see DESIGN.md).
+# Polars expression mirroring ``parse_cruise_camera``'s cruise extraction:
+# anchor on the ``Stingray`` path segment, skip one segment (``data``), and
+# capture the next one (``cruise``). Kept in lockstep with the Python parser by
+# ``test_cruise_expr_matches_parser``. Unlike the parser this returns null on a
+# non-matching path rather than raising — safe here because ``aggregate_videos``
+# (always run first in the CLI) validates every path via ``parse_cruise_camera``
+# before the frames stage is reached.
+_CRUISE_PATTERN = r"Stingray/[^/]+/([^/]+)/"
 
-    Bad-file sentinel rows are dropped (see ``_scan_ok_frames``).
+
+def _frames_lazy(csv_paths: Iterable[str | Path]) -> pl.LazyFrame:
+    """Per-frame rows projected to the ``Frame`` schema, with a derived cruise.
+
+    Shared transform behind both :func:`aggregate_frames` (whole corpus) and
+    :func:`iter_frame_chunks` (one cruise at a time). Not sorted — callers add
+    the ordering they need. Bad-file sentinel rows are dropped (see
+    ``_scan_ok_frames``).
     """
-    scanned = _scan_ok_frames(csv_paths).collect()
-    cruises = [parse_cruise_camera(p)[0] for p in scanned["media_path"].to_list()]
     return (
-        scanned.with_columns(
-            pl.Series("cruise", cruises),
+        _scan_ok_frames(csv_paths)
+        .with_columns(
+            pl.col("media_path").str.extract(_CRUISE_PATTERN, 1).alias("cruise"),
             pl.col("media").alias("video_id"),
             pl.col("frame").cast(pl.Int64).alias("frame_index"),
             pl.col("times").str.to_datetime(strict=False, time_zone="UTC").alias("frame_time"),
         )
         .select(["video_id", "frame_index", "frame_time", "status", "cruise"])
-        .sort(["cruise", "video_id", "frame_index"])
     )
+
+
+def aggregate_frames(csv_paths: Iterable[str | Path]) -> pl.DataFrame:
+    """One row per frame, sorted for parquet range pruning (see DESIGN.md).
+
+    Materializes the whole corpus at once — fine for per-cruise smoke tests and
+    unit tests. For full-corpus ingest use :func:`iter_frame_chunks`, which
+    bounds peak memory to a single cruise.
+    """
+    return _frames_lazy(csv_paths).sort(["cruise", "video_id", "frame_index"]).collect()
+
+
+def iter_frame_chunks(
+    csv_paths: Iterable[str | Path], cruises: Iterable[str]
+):
+    """Yield ``(cruise, frames_df)`` one cruise at a time, sorted within cruise.
+
+    Resolves the ``frames`` table's TODO(M7): instead of materializing all
+    frames in RAM before a single ``store.write``, this caps peak memory at one
+    cruise's worth of rows. Each yielded DataFrame is sorted by
+    ``(video_id, frame_index)`` so the per-cruise parquet keeps its
+    range-pruning order (cruise is constant within a chunk, so the leading
+    cruise sort key from :func:`aggregate_frames` is redundant here).
+
+    Trade-off: the CSVs are lazily re-scanned once per cruise. That trades I/O
+    for bounded memory — the right call for an offline backfill on storage that
+    can't hold the whole frame corpus at once. ``cruises`` should come from the
+    already-validated ``aggregate_videos`` output so every value is real.
+    """
+    lazy = _frames_lazy(csv_paths)
+    for cruise in cruises:
+        chunk = (
+            lazy.filter(pl.col("cruise") == cruise)
+            .sort(["video_id", "frame_index"])
+            .collect()
+        )
+        yield cruise, chunk
 
 
 def count_id_link_nonempty(csv_paths: Iterable[str | Path]) -> int:
