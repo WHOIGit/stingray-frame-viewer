@@ -11,6 +11,15 @@ from typing import Iterable
 
 import polars as pl
 
+# Run every full-corpus collect through Polars' streaming engine. The default
+# in-memory engine materializes all referenced columns of every CSV row before
+# it aggregates — on a cruise corpus (millions of frame rows) that alone
+# exhausts RAM, even though the grouped/filtered output is tiny. The streaming
+# engine processes the scan in batches and keeps only the running aggregate
+# (group-by hash table / counter) resident. Results are identical; only the
+# execution strategy differs.
+_ENGINE = "streaming"
+
 
 def parse_cruise_camera(media_path: str) -> tuple[str, str]:
     """Extract ``(cruise, camera)`` from a Stingray ``media_path``.
@@ -50,7 +59,7 @@ def count_bad_file_videos(csv_paths: Iterable[str | Path]) -> int:
         _scan(csv_paths)
         .filter(pl.col("frame").is_null())
         .select(pl.col("media_path").n_unique())
-        .collect()
+        .collect(engine=_ENGINE)
         .item()
     )
 
@@ -69,7 +78,7 @@ def aggregate_videos(csv_paths: Iterable[str | Path]) -> pl.DataFrame:
             pl.len().alias("frame_count"),
             pl.col("media_time").first().alias("media_time"),
         )
-        .collect()
+        .collect(engine=_ENGINE)
     )
 
     cruises = []
@@ -124,7 +133,11 @@ def aggregate_frames(csv_paths: Iterable[str | Path]) -> pl.DataFrame:
     unit tests. For full-corpus ingest use :func:`iter_frame_chunks`, which
     bounds peak memory to a single cruise.
     """
-    return _frames_lazy(csv_paths).sort(["cruise", "video_id", "frame_index"]).collect()
+    return (
+        _frames_lazy(csv_paths)
+        .sort(["cruise", "video_id", "frame_index"])
+        .collect(engine=_ENGINE)
+    )
 
 
 def iter_frame_chunks(
@@ -146,10 +159,12 @@ def iter_frame_chunks(
     """
     lazy = _frames_lazy(csv_paths)
     for cruise in cruises:
+        # Streaming scan+filter so only this cruise's rows are materialized for
+        # the sort, not the whole frame corpus (see _ENGINE).
         chunk = (
             lazy.filter(pl.col("cruise") == cruise)
             .sort(["video_id", "frame_index"])
-            .collect()
+            .collect(engine=_ENGINE)
         )
         yield cruise, chunk
 
@@ -169,7 +184,7 @@ def count_id_link_nonempty(csv_paths: Iterable[str | Path]) -> int:
         cond = c if cond is None else (cond | c)
     if cond is None:
         return 0
-    return int(_scan(csv_paths).filter(cond).select(pl.len()).collect().item())
+    return int(_scan(csv_paths).filter(cond).select(pl.len()).collect(engine=_ENGINE).item())
 
 
 def distinct_cruise_camera(videos_df: pl.DataFrame) -> list[tuple[str, str]]:
