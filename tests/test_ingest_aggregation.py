@@ -8,7 +8,7 @@ import pytest
 from stingray_frame_viewer.ingest.aggregate import (
     aggregate_frames,
     aggregate_videos,
-    count_bad_file_videos,
+    count_excluded_videos,
     count_id_link_nonempty,
 )
 
@@ -133,11 +133,33 @@ def test_bad_file_videos_excluded(tmp_path):
         f"{bad_path},bad,2026-01-13 19:31:00.000,,,bad_file,,",
     ]
     csv = _write_csv(tmp_path, "with_bad.csv", rows)
-    assert count_bad_file_videos([csv]) == 1
+    assert count_excluded_videos([csv]).bad_file == 1
     videos = aggregate_videos([csv])
     assert videos["video_id"].to_list() == ["good"]
     frames = aggregate_frames([csv])
     assert frames["video_id"].to_list() == ["good", "good"]
+
+
+def test_skip_directory_videos_excluded(tmp_path):
+    """A video parked under a skip/ directory is excluded from the manifest and
+    never reaches the cruise/camera parser (the extra segment would misparse it)."""
+    good = _path("NESLTER_AR88", "Basler_avA2300-25gm", "good")
+    # Real-world shape from the data: an extra 'skip' segment after the camera.
+    skipped = (
+        "/proj/nes-lter/Stingray/data/NESLTER_AR88/Basler_a2a2840-14gmBAS/skip/"
+        "20250424T143241.787Z/Basler_a2a2840-14gmBAS-004-20250424T143435.560Z.avi"
+    )
+    rows = [
+        _row(good, "good", "2025-04-25 15:22:15.851", 0, "2025-04-25 15:22:15.917"),
+        _row(good, "good", "2025-04-25 15:22:15.851", 1, "2025-04-25 15:22:15.984"),
+        _row(skipped, "skipvid", "2025-04-24 14:32:41.787", 0, "2025-04-24 14:32:41.853"),
+        _row(skipped, "skipvid", "2025-04-24 14:32:41.787", 1, "2025-04-24 14:32:41.920"),
+    ]
+    csv = _write_csv(tmp_path, "with_skip.csv", rows)
+    assert count_excluded_videos([csv]).skipped == 1
+    # The skip video is absent from both tables — no phantom cruise/camera.
+    assert aggregate_videos([csv])["video_id"].to_list() == ["good"]
+    assert set(aggregate_frames([csv])["video_id"].to_list()) == {"good"}
 
 
 def test_count_id_link_detects_nonempty(tmp_path):

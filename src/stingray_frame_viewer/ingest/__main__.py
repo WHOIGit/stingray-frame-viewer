@@ -17,10 +17,12 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
+import polars as pl
+
 from ..manifest import ensure_frames_table, ensure_videos_table, open_store
 from .aggregate import (
     aggregate_videos,
-    count_bad_file_videos,
+    count_excluded_videos,
     count_id_link_nonempty,
     distinct_cruise_camera,
     iter_frame_chunks,
@@ -125,6 +127,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--frames", action="store_true", help="Also build the per-frame table.")
     parser.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help="Write only partitions not already in the manifest and skip the rest, "
+        "instead of refusing the whole run when any (cruise, camera) already exists. "
+        "Makes adding a new cruise idempotent — point at the full corpus and only the "
+        "new partitions are written.",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Aggregate and print a summary; do not write to the store.",
@@ -170,18 +180,24 @@ def main(argv: list[str] | None = None) -> int:
     with _phase("scan: id/link sanity check"):
         nonempty = count_id_link_nonempty(csv_paths)
     if nonempty:
-        log.warning(
-            "%d rows have non-empty id/link (DESIGN.md says these are empty today — escalate)",
-            nonempty,
-        )
+        # Historically these columns were empty and a non-empty value was an
+        # escalation trigger; in practice they are now routinely populated and
+        # carry nothing the manifest uses, so this is DEBUG-level only.
+        log.debug("%d rows have non-empty id/link (informational; columns are ignored)", nonempty)
 
-    with _phase("scan: bad-file sentinels"):
-        bad_videos = count_bad_file_videos(csv_paths)
-    if bad_videos:
+    with _phase("scan: excluded videos (bad-file + skip)"):
+        excluded = count_excluded_videos(csv_paths)
+    if excluded.bad_file:
         log.info(
             "skipping %d video(s) flagged unreadable in the CSV "
             "(status='bad_file', no frame rows) — absent from the manifest",
-            bad_videos,
+            excluded.bad_file,
+        )
+    if excluded.skipped:
+        log.info(
+            "skipping %d video(s) parked under a 'skip/' directory "
+            "(operator-marked — absent from the manifest)",
+            excluded.skipped,
         )
 
     with _phase("aggregate: videos"):
@@ -204,45 +220,92 @@ def main(argv: list[str] | None = None) -> int:
     with _phase("check existing partitions"):
         existing = _existing_partitions(store)
     conflicts = sorted(set(partitions) & existing)
-    if conflicts:
-        log.error("refusing to write — these (cruise, camera) partitions already exist:")
-        for cruise, camera in conflicts:
-            log.error("  cruise=%s camera=%s", cruise, camera)
-        log.error("Re-ingest requires an out-of-band full reingest (the CLI is append-only).")
-        return 2
-
+    # A dry run *previews* — it reports conflicts as information and still prints
+    # the full plan. Only a real run acts on them, per --skip-existing below.
     if args.dry_run:
+        existing_fate = "would be skipped" if args.skip_existing else "would be rejected"
         for cruise, camera in partitions:
             subset = videos_df.filter(
                 (videos_df["cruise"] == cruise) & (videos_df["camera"] == camera)
             )
-            log.info("[dry-run] cruise=%s camera=%s videos=%d", cruise, camera, subset.height)
+            status = f"EXISTS — {existing_fate}" if (cruise, camera) in existing else "new"
+            log.info(
+                "[dry-run] cruise=%s camera=%s videos=%d (%s)",
+                cruise, camera, subset.height, status,
+            )
+        new_count = len(partitions) - len(conflicts)
         log.info(
-            "done [dry-run]: %d partition(s), %d video(s) in %.1fs",
+            "done [dry-run]: %d partition(s) — %d new, %d already exist; %d video(s) in %.1fs",
             len(partitions),
+            new_count,
+            len(conflicts),
             videos_df.height,
             time.monotonic() - run_start,
         )
         return 0
 
-    with _phase(f"write: videos table ({videos_df.height} rows)"):
-        store.write("videos", videos_df.to_arrow())
+    # Decide what to actually write. Default is all-or-nothing (refuse on any
+    # conflict). --skip-existing instead drops the already-present partitions
+    # and writes only the new ones, at (cruise, camera) granularity.
+    if conflicts and not args.skip_existing:
+        log.error("refusing to write — these (cruise, camera) partitions already exist:")
+        for cruise, camera in conflicts:
+            log.error("  cruise=%s camera=%s", cruise, camera)
+        log.error(
+            "Re-ingest requires an out-of-band full reingest, or pass --skip-existing "
+            "to write only the new partitions (the CLI is append-only)."
+        )
+        return 2
+
+    write_partitions = [p for p in partitions if p not in existing]
+    if args.skip_existing and conflicts:
+        for cruise, camera in conflicts:
+            log.info(
+                "skip-existing: cruise=%s camera=%s already in manifest — not rewriting",
+                cruise, camera,
+            )
+    if not write_partitions:
+        log.info(
+            "nothing new to write — all %d partition(s) already exist (%.1fs)",
+            len(partitions), time.monotonic() - run_start,
+        )
+        return 0
+
+    # Restrict the videos rows (and the set of frame video_ids) to the partitions
+    # we're actually writing. With no skipping this is a no-op pass-through.
+    if len(write_partitions) == len(partitions):
+        videos_to_write = videos_df
+    else:
+        wp_df = pl.DataFrame(
+            {"cruise": [c for c, _ in write_partitions], "camera": [cam for _, cam in write_partitions]}
+        )
+        videos_to_write = videos_df.join(wp_df, on=["cruise", "camera"], how="semi")
+
+    with _phase(f"write: videos table ({videos_to_write.height} rows)"):
+        store.write("videos", videos_to_write.to_arrow())
 
     frame_total = 0
     if args.frames:
-        # Write one cruise at a time so peak RAM is bounded to a single
-        # cruise's frames rather than the whole corpus (see iter_frame_chunks).
-        # Each cruise is a fresh `frames` partition (conflicts rejected above),
-        # so these appends never collide. This is the long pole on a full
-        # corpus, so each cruise gets its own timed phase.
-        frame_cruises = sorted({cruise for cruise, _ in partitions})
+        # Write one cruise at a time so peak RAM is bounded to a single cruise's
+        # frames rather than the whole corpus (see iter_frame_chunks). For a
+        # cruise that only partially exists (a new camera on an existing cruise),
+        # iter_frame_chunks yields every camera's frames for that cruise, so we
+        # filter each chunk down to the videos we're actually writing before the
+        # append — otherwise the existing camera's frames would be re-appended
+        # into the cruise's (cruise-keyed) frame partition.
+        writable_ids = set(videos_to_write["video_id"].to_list())
+        frame_cruises = sorted({cruise for cruise, _ in write_partitions})
         log.info("writing frames for %d cruise(s)", len(frame_cruises))
         for cruise, chunk in iter_frame_chunks(csv_paths, frame_cruises):
+            if len(write_partitions) != len(partitions):
+                chunk = chunk.filter(pl.col("video_id").is_in(writable_ids))
             with _phase(f"write: frames cruise={cruise} ({chunk.height} rows)"):
                 store.write("frames", chunk.to_arrow())
             frame_total += chunk.height
 
-    summary = f"done: {len(partitions)} partition(s), {videos_df.height} video(s)"
+    summary = f"done: {len(write_partitions)} partition(s), {videos_to_write.height} video(s)"
+    if conflicts and args.skip_existing:
+        summary += f" ({len(conflicts)} existing partition(s) skipped)"
     if args.frames:
         summary += f", {frame_total} frame(s)"
     summary += f" in {time.monotonic() - run_start:.1f}s"

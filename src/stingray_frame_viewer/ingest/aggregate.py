@@ -7,7 +7,7 @@ aggregation directly unit-testable.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, NamedTuple
 
 import polars as pl
 
@@ -19,6 +19,26 @@ import polars as pl
 # (group-by hash table / counter) resident. Results are identical; only the
 # execution strategy differs.
 _ENGINE = "streaming"
+
+# Videos parked under a ``skip/`` directory are operator-marked "do not ingest".
+# The marker also breaks cruise/camera parsing: the extra path segment shifts
+# the trailing positions (``.../{cruise}/{camera}/skip/{ts}/{file}.avi``), so a
+# skip video would otherwise land the camera in the cruise slot and ``skip`` in
+# the camera slot. Excluding by path keeps them out of the manifest entirely.
+# Case-sensitive, matched as a whole path segment (bounded by slashes).
+_SKIP_MARKER = "/skip/"
+
+
+def _is_skipped() -> pl.Expr:
+    """True for media_path values that contain a ``skip/`` path segment."""
+    return pl.col("media_path").str.contains(_SKIP_MARKER, literal=True)
+
+
+class ExclusionCounts(NamedTuple):
+    """Per-reason counts of videos deliberately left out of the manifest."""
+
+    bad_file: int  # status='bad_file' sentinel: unreadable source, no frames
+    skipped: int  # parked under a skip/ directory: operator-marked do-not-ingest
 
 
 def parse_cruise_camera(media_path: str) -> tuple[str, str]:
@@ -46,24 +66,37 @@ def _scan(csv_paths: Iterable[str | Path]) -> pl.LazyFrame:
 
 
 def _scan_ok_frames(csv_paths: Iterable[str | Path]) -> pl.LazyFrame:
-    """Scan only the per-frame rows; drop sentinel rows for unreadable videos.
+    """Scan the per-frame rows that belong in the manifest.
 
-    The Stingray CSV emits a single ``status='bad_file'`` row (with null
-    ``frame``/``times``) per unreadable video instead of per-frame rows. Those
-    videos have no frames to serve, so they don't belong in the manifest.
+    Drops two kinds of rows up front, so neither videos nor frames aggregation
+    (and neither the cruise/camera parser) ever sees them:
+
+    - ``status='bad_file'`` sentinels (null ``frame``): the Stingray CSV emits
+      one per unreadable video instead of per-frame rows — no frames to serve.
+    - ``skip/`` directory videos: operator-marked do-not-ingest (see
+      ``_SKIP_MARKER``).
     """
-    return _scan(csv_paths).filter(pl.col("frame").is_not_null())
+    return _scan(csv_paths).filter(pl.col("frame").is_not_null() & ~_is_skipped())
 
 
-def count_bad_file_videos(csv_paths: Iterable[str | Path]) -> int:
-    """Count distinct media_path values flagged as unreadable in the CSV."""
-    return int(
+def count_excluded_videos(csv_paths: Iterable[str | Path]) -> ExclusionCounts:
+    """Distinct-video counts for each exclusion reason, in a single scan.
+
+    Categories are disjoint: a video parked under ``skip/`` is counted only as
+    ``skipped`` even if it also carries a bad-file sentinel.
+    """
+    res = (
         _scan(csv_paths)
-        .filter(pl.col("frame").is_null())
-        .select(pl.col("media_path").n_unique())
+        .select(
+            pl.col("media_path")
+            .filter(pl.col("frame").is_null() & ~_is_skipped())
+            .n_unique()
+            .alias("bad_file"),
+            pl.col("media_path").filter(_is_skipped()).n_unique().alias("skipped"),
+        )
         .collect(engine=_ENGINE)
-        .item()
     )
+    return ExclusionCounts(int(res["bad_file"][0]), int(res["skipped"][0]))
 
 
 def aggregate_videos(csv_paths: Iterable[str | Path]) -> pl.DataFrame:
