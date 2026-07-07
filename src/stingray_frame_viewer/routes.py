@@ -15,6 +15,7 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse
 
+from .cache import FrameCache, cache_key
 from .config import Settings
 from .encoder import encode
 from .errors import FrameOutOfRangeError, VideoNotFoundError
@@ -33,6 +34,12 @@ def get_manifest(request: Request) -> dict[str, Video]:
 
 def get_settings(request: Request) -> Settings:
     return request.app.state.settings
+
+
+def get_cache(request: Request) -> FrameCache | None:
+    # None when the cache is disabled (Phase 1) or the app was built without a
+    # lifespan (route tests wire app.state manually).
+    return getattr(request.app.state, "cache", None)
 
 
 @router.get("/health")
@@ -68,6 +75,7 @@ def get_frame(
     format: str = Query("png"),
     manifest: dict[str, Video] = Depends(get_manifest),
     settings: Settings = Depends(get_settings),
+    cache: FrameCache | None = Depends(get_cache),
 ) -> Response:
     if format not in _ALLOWED_FORMATS:
         raise HTTPException(
@@ -80,8 +88,21 @@ def get_frame(
     if frame_index < 0 or frame_index >= video.frame_count:
         raise FrameOutOfRangeError(video_id, frame_index, video.frame_count)
 
-    frame = extract_frame(video.media_path, frame_index)
-    body = encode(frame, format, jpeg_quality=settings.jpeg_quality)
+    # Phase 2 lazy write-through. On a cache hit serve the stored bytes; on a
+    # miss (or with the cache disabled) extract + encode on the fly, then write
+    # the encoded frame back under a stable key. A read that probes true but
+    # then fails returns None here, so we fall through to re-extraction.
+    key = cache_key(video_id, frame_index, format)
+    body: bytes | None = None
+    if cache is not None and cache.probe(key):
+        body = cache.get(key)
+
+    if body is None:
+        frame = extract_frame(video.media_path, frame_index)
+        body = encode(frame, format, jpeg_quality=settings.jpeg_quality)
+        if cache is not None:
+            cache.put(key, body)  # best-effort; failures are logged, not raised
+
     media_type = "image/png" if format == "png" else "image/jpeg"
     # video_id is the verbatim CSV `media` column, which the manifest treats
     # as immutable — so the immutable Cache-Control is safe even on the

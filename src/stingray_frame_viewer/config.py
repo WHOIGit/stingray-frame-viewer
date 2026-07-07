@@ -4,9 +4,8 @@ Reads ``STINGRAY_*`` environment variables (see ``.env.example``): manifest
 store root, manifest S3 credentials, cache toggle and credentials, default
 frame format, JPEG quality, and neighbors-endpoint window.
 
-The cache_* and neighbor_window fields are parsed today for forward
-compatibility but are not consulted by the M4 route layer — they land when
-the cache (M5) and neighbors endpoint (M6) are wired in.
+When ``STINGRAY_CACHE_ENABLED=true``, the route layer uses the cache settings
+to read/write encoded frame bytes through amplify-storage-utils' BucketStore.
 """
 from __future__ import annotations
 
