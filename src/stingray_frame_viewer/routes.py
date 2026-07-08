@@ -93,9 +93,7 @@ def get_frame(
     # the encoded frame back under a stable key. A read that probes true but
     # then fails returns None here, so we fall through to re-extraction.
     key = cache_key(video_id, frame_index, format)
-    body: bytes | None = None
-    if cache is not None and cache.probe(key):
-        body = cache.get(key)
+    body: bytes | None = cache.get(key) if cache is not None else None
 
     if body is None:
         frame = extract_frame(video.media_path, frame_index)

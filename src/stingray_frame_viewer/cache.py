@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING
 
 from .config import Settings
 
+from botocore.exceptions import BotoCoreError, ClientError
 if TYPE_CHECKING:  # avoid importing the S3 stack unless the cache is enabled
     from storage.s3 import BucketStore
 
@@ -93,12 +94,38 @@ class FrameCache:
             return False
 
     def get(self, key: str) -> bytes | None:
-        """Return cached bytes, or ``None`` on any read failure (→ re-extract)."""
+        """Return cached bytes, or ``None`` on a miss / degraded cache.
+ 
+        Three failure tiers, all of which degrade to on-the-fly extraction
+        (the Video is the source of truth, so a cache problem must never deny a
+        frame we could still produce) but with different loudness:
+ 
+        * ``NoSuchKey`` / ``404`` — the normal cold-cache miss. Silent.
+        * any other ``ClientError`` — S3 answered with an error (AccessDenied,
+          throttle, 5xx). Logged at ERROR so it surfaces during bring-up.
+        * ``BotoCoreError`` — couldn't reach S3 at all (VAST down, DNS,
+          connect/read timeout). These do NOT carry a ``.response`` and are a
+          distinct subclass from ``ClientError``. Logged at ERROR with a trace.
+ 
+        Anything else (a ``KeyError``/``TypeError`` in our own code) is a bug,
+        not a storage condition, so it is deliberately NOT caught — let it
+        propagate rather than hide behind a silent ``None``.
+ 
+        Note: a sustained VAST outage silently degrades every request to
+        extraction (loud in logs, but nothing is paged).
+        """
+ 
         try:
             return self._store.get(key)
-        except Exception:  # noqa: BLE001 - cache is best-effort
-            logger.warning("cache get failed for key=%s", key, exc_info=True)
-            return None
+        except ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code")
+            if code in ("NoSuchKey", "404"):
+                return None  # expected miss — stay quiet
+            logger.error("cache get: S3 returned error %s for key=%s", code, key)
+            return None  # degrade, but loud
+        except BotoCoreError:
+            logger.error("cache get: cannot reach S3 for key=%s", key, exc_info=True)
+            return None  # VAST down / timeout — degrade, but loud
 
     def put(self, key: str, body: bytes) -> None:
         """Write ``body`` under ``key``. Failures are swallowed (logged)."""

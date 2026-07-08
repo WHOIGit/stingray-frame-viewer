@@ -11,6 +11,8 @@ boto3 client is never needed here.
 """
 from __future__ import annotations
 
+import pytest
+
 from stingray_frame_viewer.cache import cache_key
 from stingray_frame_viewer.encoder import encode
 from stingray_frame_viewer.routes import get_cache
@@ -61,8 +63,7 @@ def test_cache_miss_extracts_and_writes_through(client, routes_app, expected_fra
     assert r.headers["cache-control"] == IMMUTABLE
 
     key = cache_key(TEST_VIDEO_ID, 0, "png")
-    assert cache.probes == [key]          # probed once
-    assert cache.gets == []               # miss → never read
+    assert cache.gets == [key]            # single GET doubles as the miss check
     assert cache.puts == [key]            # wrote the freshly encoded frame
     assert cache.store[key] == expected   # ...and stored the exact bytes served
 
@@ -81,7 +82,6 @@ def test_cache_hit_serves_stored_bytes_without_extracting(client, routes_app):
     assert r.content == sentinel                      # served from cache
     assert r.headers["content-type"] == "image/png"
     assert r.headers["cache-control"] == IMMUTABLE
-    assert cache.probes == [key]
     assert cache.gets == [key]
     assert cache.puts == []                           # nothing written on a hit
 
@@ -89,14 +89,13 @@ def test_cache_hit_serves_stored_bytes_without_extracting(client, routes_app):
 def test_cache_get_failure_falls_back_to_extraction(client, routes_app, expected_frame):
     key = cache_key(TEST_VIDEO_ID, 0, "png")
     cache = FakeCache(seed={key: b"stale-unreadable"})
-    cache.get_returns_none = True  # probe says hit, but the read comes back empty
+    cache.get_returns_none = True  # read error swallowed by FrameCache.get → None
     _use_cache(routes_app, cache)
 
     r = client.get(f"/frames/{TEST_VIDEO_ID}/0")
 
     assert r.status_code == 200
     assert r.content == encode(expected_frame(0), "png")  # re-extracted, not stale
-    assert cache.probes == [key]
     assert cache.gets == [key]
     assert cache.puts == [key]                            # re-written after fallback
 
@@ -125,3 +124,53 @@ def test_cache_disabled_behaves_like_phase1(client, expected_frame):
     r = client.get(f"/frames/{TEST_VIDEO_ID}/0")
     assert r.status_code == 200
     assert r.content == encode(expected_frame(0), "png")
+
+
+# --- FrameCache.get: botocore error handling (exercises the real except clause) ---
+
+from botocore.exceptions import BotoCoreError, ClientError, EndpointConnectionError  # noqa: E402
+
+from stingray_frame_viewer.cache import FrameCache  # noqa: E402
+
+
+class _RaisingStore:
+    """Minimal BucketStore stand-in whose get() raises a given exception."""
+
+    def __init__(self, exc: Exception) -> None:
+        self._exc = exc
+
+    def get(self, key):
+        raise self._exc
+
+
+def _client_error(code: str) -> ClientError:
+    return ClientError({"Error": {"Code": code}}, "GetObject")
+
+
+def test_framecache_get_missing_key_returns_none():
+    # NoSuchKey / 404 are the normal cold-cache case → quiet None, not an error.
+    for code in ("NoSuchKey", "404"):
+        cache = FrameCache(_RaisingStore(_client_error(code)))
+        assert cache.get("whatever.png") is None
+
+
+def test_framecache_get_s3_error_returns_none():
+    # S3 answered with an error (e.g. AccessDenied) → degrade to None (logged).
+    cache = FrameCache(_RaisingStore(_client_error("AccessDenied")))
+    assert cache.get("whatever.png") is None
+
+
+def test_framecache_get_unreachable_returns_none():
+    # Can't reach S3 (VAST down / timeout) is a BotoCoreError, NOT a ClientError,
+    # and has no .response → must be handled by its own branch, degrade to None.
+    exc = EndpointConnectionError(endpoint_url="https://vast.whoi.edu")
+    assert isinstance(exc, BotoCoreError) and not isinstance(exc, ClientError)
+    cache = FrameCache(_RaisingStore(exc))
+    assert cache.get("whatever.png") is None
+
+
+def test_framecache_get_bug_propagates():
+    # A non-storage error (a bug in our code) must NOT be swallowed as a miss.
+    cache = FrameCache(_RaisingStore(TypeError("boom")))
+    with pytest.raises(TypeError):
+        cache.get("whatever.png")
