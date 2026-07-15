@@ -16,7 +16,7 @@ dependencies = [
     "polars",
     "fastapi>=0.110",
     "uvicorn[standard]>=0.27",
-    "amplify-db-utils @ git+https://github.com/WHOIGit/amplify-db-utils.git",
+    "amplify-db-utils @ git+https://github.com/WHOIGit/amplify-db-utils.git@v0.1.0",
     "amplify-storage-utils[s3] @ git+https://github.com/WHOIGit/amplify-storage-utils.git",
 ]
 
