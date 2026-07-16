@@ -88,11 +88,11 @@ def get_frame(
     if frame_index < 0 or frame_index >= video.frame_count:
         raise FrameOutOfRangeError(video_id, frame_index, video.frame_count)
 
-    # Phase 2 lazy write-through. On a cache hit serve the stored bytes; on a
-    # miss (or with the cache disabled) extract + encode on the fly, then write
-    # the encoded frame back under a stable key. A read that probes true but
-    # then fails returns None here, so we fall through to re-extraction.
-    key = cache_key(video_id, frame_index, format)
+    # Phase 2 lazy write-through. A single GET doubles as the existence check:
+    # on a hit it returns the stored bytes; on a miss it returns None (see
+    # FrameCache.get), so we extract + encode on the fly and write the frame
+    # back under a stable key.
+    key = cache_key(video_id, frame_index, format, prefix=settings.cache_prefix)
     body: bytes | None = cache.get(key) if cache is not None else None
 
     if body is None:
