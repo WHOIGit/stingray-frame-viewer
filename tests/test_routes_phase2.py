@@ -18,6 +18,7 @@ from stingray_frame_viewer.encoder import encode
 from stingray_frame_viewer.routes import get_cache
 
 TEST_VIDEO_ID = "vid-1"
+PREFIX = "stingray_frames"   # matches Settings.cache_prefix default used by the fixture
 IMMUTABLE = "public, max-age=31536000, immutable"
 
 
@@ -62,14 +63,14 @@ def test_cache_miss_extracts_and_writes_through(client, routes_app, expected_fra
     assert r.headers["content-type"] == "image/png"
     assert r.headers["cache-control"] == IMMUTABLE
 
-    key = cache_key(TEST_VIDEO_ID, 0, "png")
+    key = cache_key(TEST_VIDEO_ID, 0, "png", PREFIX)
     assert cache.gets == [key]            # single GET doubles as the miss check
     assert cache.puts == [key]            # wrote the freshly encoded frame
     assert cache.store[key] == expected   # ...and stored the exact bytes served
 
 
 def test_cache_hit_serves_stored_bytes_without_extracting(client, routes_app):
-    key = cache_key(TEST_VIDEO_ID, 0, "png")
+    key = cache_key(TEST_VIDEO_ID, 0, "png", PREFIX)
     # Sentinel bytes that are NOT what the encoder would produce, so a match
     # proves the response came from the cache rather than a fresh extraction.
     sentinel = b"\x89PNG\r\n\x1a\n--served-from-cache-sentinel--"
@@ -87,7 +88,7 @@ def test_cache_hit_serves_stored_bytes_without_extracting(client, routes_app):
 
 
 def test_cache_get_failure_falls_back_to_extraction(client, routes_app, expected_frame):
-    key = cache_key(TEST_VIDEO_ID, 0, "png")
+    key = cache_key(TEST_VIDEO_ID, 0, "png", PREFIX)
     cache = FakeCache(seed={key: b"stale-unreadable"})
     cache.get_returns_none = True  # read error swallowed by FrameCache.get → None
     _use_cache(routes_app, cache)
@@ -101,7 +102,7 @@ def test_cache_get_failure_falls_back_to_extraction(client, routes_app, expected
 
 
 def test_cache_jpeg_uses_separate_key(client, routes_app):
-    png_key = cache_key(TEST_VIDEO_ID, 0, "png")
+    png_key = cache_key(TEST_VIDEO_ID, 0, "png", PREFIX)
     cache = FakeCache(seed={png_key: b"a-png-object"})
     _use_cache(routes_app, cache)
 
@@ -109,8 +110,8 @@ def test_cache_jpeg_uses_separate_key(client, routes_app):
 
     assert r.status_code == 200
     assert r.content.startswith(b"\xff\xd8\xff")  # real JPEG, freshly encoded
-    jpeg_key = cache_key(TEST_VIDEO_ID, 0, "jpeg")
-    assert jpeg_key == f"{TEST_VIDEO_ID}_0.jpg"
+    jpeg_key = cache_key(TEST_VIDEO_ID, 0, "jpeg", PREFIX)
+    assert jpeg_key == f"stingray_frames/{TEST_VIDEO_ID}/0.jpg"
     assert jpeg_key != png_key
     # The seeded PNG must not satisfy a JPEG request: distinct key → a miss →
     # written under the JPEG key, leaving the PNG object untouched.
@@ -174,3 +175,26 @@ def test_framecache_get_bug_propagates():
     cache = FrameCache(_RaisingStore(TypeError("boom")))
     with pytest.raises(TypeError):
         cache.get("whatever.png")
+
+
+# --- cache_key: slash-delimited, prefixed layout -------------------------------
+
+from stingray_frame_viewer.cache import video_prefix  # noqa: E402
+
+
+def test_cache_key_layout():
+    assert cache_key("Basler-481-Z", 83, "png", PREFIX) == "stingray_frames/Basler-481-Z/83.png"
+    assert cache_key("Basler-481-Z", 84, "jpeg", PREFIX) == "stingray_frames/Basler-481-Z/84.jpg"
+
+
+def test_cache_key_custom_and_blank_prefix():
+    assert cache_key("vid", 5, "png", prefix="p/q") == "p/q/vid/5.png"
+    assert cache_key("vid", 5, "png", prefix="/p/") == "p/vid/5.png"   # slashes normalized
+    assert cache_key("vid", 5, "png", prefix="") == "vid/5.png"        # no leading folder
+
+
+def test_video_prefix_matches_key_prefix():
+    # The skip-scan lists video_prefix(...); every key under a video must start with it.
+    vp = video_prefix("vid", "stingray_frames")
+    assert cache_key("vid", 0, "png", PREFIX).startswith(vp)
+    assert vp == "stingray_frames/vid/"
