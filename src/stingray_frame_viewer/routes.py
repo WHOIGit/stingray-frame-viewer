@@ -14,6 +14,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse
+from starlette.background import BackgroundTask
 
 from .cache import FrameCache, cache_key
 from .config import Settings
@@ -95,11 +96,17 @@ def get_frame(
     key = cache_key(video_id, frame_index, format, prefix=settings.cache_prefix)
     body: bytes | None = cache.get(key) if cache is not None else None
 
+    # On a miss, write the frame back off the hot path: the client already has
+    # its bytes in `body`, so the S3 PUT runs as a BackgroundTask after the
+    # response is sent (in the threadpool, so the event loop isn't blocked) and
+    # never adds latency to the request. cache.put is best-effort — a failure is
+    # logged, not raised — so a background write can't affect a served response.
+    write_back: BackgroundTask | None = None
     if body is None:
         frame = extract_frame(video.media_path, frame_index)
         body = encode(frame, format, jpeg_quality=settings.jpeg_quality)
         if cache is not None:
-            cache.put(key, body)  # best-effort; failures are logged, not raised
+            write_back = BackgroundTask(cache.put, key, body)
 
     media_type = "image/png" if format == "png" else "image/jpeg"
     # video_id is the verbatim CSV `media` column, which the manifest treats
@@ -109,4 +116,5 @@ def get_frame(
         content=body,
         media_type=media_type,
         headers={"Cache-Control": _FRAME_CACHE_CONTROL},
+        background=write_back,
     )
