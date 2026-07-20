@@ -14,7 +14,9 @@ from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse
+from starlette.background import BackgroundTask
 
+from .cache import FrameCache, cache_key
 from .config import Settings
 from .encoder import encode
 from .errors import FrameOutOfRangeError, VideoNotFoundError
@@ -33,6 +35,12 @@ def get_manifest(request: Request) -> dict[str, Video]:
 
 def get_settings(request: Request) -> Settings:
     return request.app.state.settings
+
+
+def get_cache(request: Request) -> FrameCache | None:
+    # None when the cache is disabled (Phase 1) or the app was built without a
+    # lifespan (route tests wire app.state manually).
+    return getattr(request.app.state, "cache", None)
 
 
 @router.get("/health")
@@ -68,6 +76,7 @@ def get_frame(
     format: str = Query("png"),
     manifest: dict[str, Video] = Depends(get_manifest),
     settings: Settings = Depends(get_settings),
+    cache: FrameCache | None = Depends(get_cache),
 ) -> Response:
     if format not in _ALLOWED_FORMATS:
         raise HTTPException(
@@ -80,8 +89,25 @@ def get_frame(
     if frame_index < 0 or frame_index >= video.frame_count:
         raise FrameOutOfRangeError(video_id, frame_index, video.frame_count)
 
-    frame = extract_frame(video.media_path, frame_index)
-    body = encode(frame, format, jpeg_quality=settings.jpeg_quality)
+    # Phase 2 lazy write-through. A single GET doubles as the existence check:
+    # on a hit it returns the stored bytes; on a miss it returns None (see
+    # FrameCache.get), so we extract + encode on the fly and write the frame
+    # back under a stable key.
+    key = cache_key(video_id, frame_index, format, prefix=settings.cache_prefix)
+    body: bytes | None = cache.get(key) if cache is not None else None
+
+    # On a miss, write the frame back off the hot path: the client already has
+    # its bytes in `body`, so the S3 PUT runs as a BackgroundTask after the
+    # response is sent (in the threadpool, so the event loop isn't blocked) and
+    # never adds latency to the request. cache.put is best-effort — a failure is
+    # logged, not raised — so a background write can't affect a served response.
+    write_back: BackgroundTask | None = None
+    if body is None:
+        frame = extract_frame(video.media_path, frame_index)
+        body = encode(frame, format, jpeg_quality=settings.jpeg_quality)
+        if cache is not None:
+            write_back = BackgroundTask(cache.put, key, body)
+
     media_type = "image/png" if format == "png" else "image/jpeg"
     # video_id is the verbatim CSV `media` column, which the manifest treats
     # as immutable — so the immutable Cache-Control is safe even on the
@@ -90,4 +116,5 @@ def get_frame(
         content=body,
         media_type=media_type,
         headers={"Cache-Control": _FRAME_CACHE_CONTROL},
+        background=write_back,
     )

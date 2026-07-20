@@ -31,6 +31,8 @@ class Settings(BaseSettings):
     cache_s3_endpoint: str | None = None
     cache_s3_access_key: str | None = None
     cache_s3_secret_key: str | None = None
+    # Base key prefix for cached frames
+    cache_prefix: str = "stingray_frames"
 
     default_format: str = "png"
     jpeg_quality: int = 90

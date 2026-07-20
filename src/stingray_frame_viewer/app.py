@@ -15,6 +15,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from .cache import FrameCache
 from .config import Settings
 from .errors import install_handlers
 from .manifest import load_manifest, open_store
@@ -32,6 +33,11 @@ async def lifespan(app: FastAPI):
         s3_secret_key=settings.store_s3_secret_key,
     )
     app.state.manifest = load_manifest(store)
+    # Phase 2: build the VAST S3 cache when enabled, else leave it None so the
+    # route serves purely on-the-fly (Phase 1). Single switch, per DESIGN.
+    app.state.cache = (
+        FrameCache.from_settings(settings) if settings.cache_enabled else None
+    )
     yield
 
 
