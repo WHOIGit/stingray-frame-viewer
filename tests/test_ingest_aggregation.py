@@ -22,6 +22,22 @@ def _path(cruise: str, camera: str, stem: str) -> str:
     )
 
 
+def _lrauv_path(cruise: str, camera: str, stem: str) -> str:
+    return (
+        f"/mnt/sosiknas2/Lab_data/LRAUV/{cruise}/basler-videos/{camera}/"
+        f"2024-02-12-14-34-27.063/{stem}.avi"
+    )
+
+
+# LRAUV CSV format: different column order, extra columns, no id/link.
+LRAUV_HEADER = "media_path,media_size,media,media_time,frame_count,status,frame,times"
+
+
+def _lrauv_row(media_path: str, media: str, media_time: str, frame: int, times: str,
+               frame_count: int = 2) -> str:
+    return f"{media_path},716505088,{media},{media_time},{frame_count},valid,{frame},{times}"
+
+
 def _row(media_path: str, media: str, media_time: str, frame: int, times: str,
          status: str = "ok", id_: str = "", link: str = "") -> str:
     return f"{media_path},{media},{media_time},{frame},{times},{status},{id_},{link}"
@@ -76,7 +92,7 @@ def test_cruise_expr_matches_parser():
     two encodings of the same path contract; this guards them from drifting)."""
     import polars as pl
 
-    from stingray_frame_viewer.ingest.aggregate import _CRUISE_PATTERN, parse_cruise_camera
+    from stingray_frame_viewer.ingest.aggregate import _cruise_expr, parse_cruise_camera
 
     paths = [
         _path("NESLTER_AR99", "Cam1", "v"),
@@ -84,10 +100,14 @@ def test_cruise_expr_matches_parser():
         "/some/other/prefix/Stingray/data/CRUISE_X/CamZ/20260101T000000.000Z/f.avi",
         # Arbitrary mount root, no "Stingray" segment (regression: prefix-agnostic).
         "/mnt/stingray_data/CRUISE_Y/CamW/20260101T000000.000Z/g.avi",
+        # LRAUV layout: extra basler-videos segment, spaces in the cruise.
+        _lrauv_path("LRAUV LTER 20240212", "pixys_isiis_camera", "v"),
+        # Spaced cruise in the plain Stingray layout.
+        _path("CRUISE WITH SPACES", "Cam1", "v"),
     ]
     via_expr = (
         pl.DataFrame({"media_path": paths})
-        .select(pl.col("media_path").str.extract(_CRUISE_PATTERN, 1).alias("cruise"))["cruise"]
+        .select(_cruise_expr().alias("cruise"))["cruise"]
         .to_list()
     )
     via_parser = [parse_cruise_camera(p)[0] for p in paths]
@@ -173,3 +193,58 @@ def test_count_id_link_detects_nonempty(tmp_path):
     ]
     csv = _write_csv(tmp_path, "dirty.csv", rows)
     assert count_id_link_nonempty([csv]) == 2
+
+
+@pytest.fixture
+def mixed_csvs(tmp_path):
+    """One old-format Stingray CSV plus one LRAUV-format CSV."""
+    old = _write_csv(tmp_path, "old.csv", [
+        _row(_path("NESLTER_AR99", "Cam1", "vold"), "vold", "2026-01-13 19:30:07.771", 0,
+             "2026-01-13 19:30:07.837"),
+        _row(_path("NESLTER_AR99", "Cam1", "vold"), "vold", "2026-01-13 19:30:07.771", 1,
+             "2026-01-13 19:30:07.904"),
+    ])
+    lp = _lrauv_path("LRAUV LTER 20240212", "pixys_isiis_camera", "vnew")
+    new = tmp_path / "lrauv.csv"
+    new.write_text("\n".join([
+        LRAUV_HEADER,
+        _lrauv_row(lp, "vnew", "2024-02-12 14:34:27.063", 0, "2024-02-12 14:34:27.063"),
+        _lrauv_row(lp, "vnew", "2024-02-12 14:34:27.063", 1, "2024-02-12 14:34:27.130"),
+    ]) + "\n")
+    return old, str(new)
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_mixed_csv_formats(mixed_csvs, reverse):
+    """Regression: a single multi-file scan_csv raised 'schema names differ' when
+    headers differed. Reading by column name must handle either file order."""
+    paths = list(reversed(mixed_csvs)) if reverse else list(mixed_csvs)
+    df = aggregate_videos(paths).sort("video_id")
+    assert df["video_id"].to_list() == ["vnew", "vold"]
+    assert df["cruise"].to_list() == ["LRAUV_LTER_20240212", "NESLTER_AR99"]
+    assert df["camera"].to_list() == ["pixys_isiis_camera", "Cam1"]
+    assert df["frame_count"].to_list() == [2, 2]
+    assert df["media_time"].to_list()[0].replace(tzinfo=None) == datetime(2024, 2, 12, 14, 34, 27, 63000)
+    assert df["media_time"].null_count() == 0
+    assert aggregate_frames(paths)["frame_time"].null_count() == 0
+    assert count_id_link_nonempty(paths) == 0
+
+
+def test_lrauv_frame_chunks_use_normalized_cruise(mixed_csvs):
+    from stingray_frame_viewer.ingest.aggregate import iter_frame_chunks
+
+    chunks = dict(iter_frame_chunks(list(mixed_csvs), ["LRAUV_LTER_20240212"]))
+    chunk = chunks["LRAUV_LTER_20240212"]
+    assert chunk["video_id"].to_list() == ["vnew", "vnew"]
+    assert chunk["frame_index"].to_list() == [0, 1]
+    assert chunk["status"].to_list() == ["valid", "valid"]
+
+
+def test_missing_required_column_names_file(tmp_path):
+    p = tmp_path / "no_status.csv"
+    p.write_text(
+        "media_path,media,media_time,frame,times\n"
+        f"{_path('C', 'Cam', 'v')},v,2026-01-13 19:30:07.771,0,2026-01-13 19:30:07.837\n"
+    )
+    with pytest.raises(ValueError, match=r"no_status\.csv: missing required column\(s\): status"):
+        aggregate_videos([str(p)])
