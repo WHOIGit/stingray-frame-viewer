@@ -6,6 +6,7 @@ aggregation directly unit-testable.
 """
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Iterable, NamedTuple
 
@@ -28,6 +29,18 @@ _ENGINE = "streaming"
 # Case-sensitive, matched as a whole path segment (bounded by slashes).
 _SKIP_MARKER = "/skip/"
 
+# LRAUV deployments add a ``basler-videos`` segment between cruise and camera
+# (``.../{cruise}/basler-videos/{camera}/{ts}/{file}.avi``). When this is the
+# fourth segment from the end, the cruise sits one segment further back.
+# Case-sensitive, matched as a whole path segment.
+_LRAUV_MARKER = "basler-videos"
+
+# Columns every CSV must carry, read by name so column order and extra columns
+# (``media_size``, ``frame_count``, ...) don't matter. Optional columns are
+# filled with nulls when absent so every file projects to the same schema.
+_REQUIRED = ("media_path", "media", "media_time", "frame", "times", "status")
+_OPTIONAL = ("id", "link")
+
 
 def _is_skipped() -> pl.Expr:
     """True for media_path values that contain a ``skip/`` path segment."""
@@ -41,6 +54,15 @@ class ExclusionCounts(NamedTuple):
     skipped: int  # parked under a skip/ directory: operator-marked do-not-ingest
 
 
+def _normalize(segment: str) -> str:
+    """Partition-key-safe form of a path segment: spaces become underscores.
+
+    Cruise and camera are Hive partition directory names; PyArrow would
+    URI-encode spaces (``%20``), so normalize them away at ingest.
+    """
+    return segment.replace(" ", "_")
+
+
 def parse_cruise_camera(media_path: str) -> tuple[str, str]:
     """Extract ``(cruise, camera)`` from a Stingray ``media_path``.
 
@@ -50,6 +72,10 @@ def parse_cruise_camera(media_path: str) -> tuple[str, str]:
     ``/mnt/stingray_data``, etc.), so we index from the *end* rather than
     anchoring on any fixed segment. This keeps ingest working for CSVs that
     reference arbitrary mount roots.
+
+    LRAUV paths insert a ``basler-videos`` segment after the cruise
+    (``.../{cruise}/basler-videos/{camera}/{timestamp}/{file}.avi``; see
+    ``_LRAUV_MARKER``). Both values are normalized with :func:`_normalize`.
     """
     parts = Path(media_path).parts
     # Need at least the final four segments: cruise/camera/timestamp/file.
@@ -57,12 +83,43 @@ def parse_cruise_camera(media_path: str) -> tuple[str, str]:
         raise ValueError(
             f"media_path is too short to contain cruise/camera/timestamp/file: {media_path}"
         )
+    if parts[-4] == _LRAUV_MARKER:
+        # ..., cruise=-5, basler-videos=-4, camera=-3, timestamp=-2, file=-1
+        if len(parts) < 5:
+            raise ValueError(
+                f"media_path is too short to contain cruise/{_LRAUV_MARKER}/camera/"
+                f"timestamp/file: {media_path}"
+            )
+        return _normalize(parts[-5]), _normalize(parts[-3])
     # ..., cruise=-4, camera=-3, timestamp=-2, file=-1
-    return parts[-4], parts[-3]
+    return _normalize(parts[-4]), _normalize(parts[-3])
+
+
+def _scan_one(csv_path: str | Path) -> pl.LazyFrame:
+    """Scan one CSV, projected by column name to ``_REQUIRED + _OPTIONAL``.
+
+    Every column is read as String (``infer_schema=False``) so per-file type
+    inference can't drift between files; callers cast what they need.
+    """
+    lf = pl.scan_csv(str(csv_path), infer_schema=False)
+    names = lf.collect_schema().names()
+    missing = [c for c in _REQUIRED if c not in names]
+    if missing:
+        raise ValueError(f"{csv_path}: missing required column(s): {', '.join(missing)}")
+    return lf.select(
+        *_REQUIRED,
+        *(pl.col(c) if c in names else pl.lit(None, pl.Utf8).alias(c) for c in _OPTIONAL),
+    )
 
 
 def _scan(csv_paths: Iterable[str | Path]) -> pl.LazyFrame:
-    return pl.scan_csv([str(p) for p in csv_paths])
+    """Scan many CSVs as one frame, tolerating differing headers.
+
+    A single multi-file ``pl.scan_csv`` requires identical headers (``schema
+    names differ``), which breaks manifests that mix CSV formats. Scanning each
+    file by name first gives every file the same schema to concatenate.
+    """
+    return pl.concat([_scan_one(p) for p in csv_paths], how="vertical")
 
 
 def _scan_ok_frames(csv_paths: Iterable[str | Path]) -> pl.LazyFrame:
@@ -132,13 +189,25 @@ def aggregate_videos(csv_paths: Iterable[str | Path]) -> pl.DataFrame:
 
 
 # Polars expression mirroring ``parse_cruise_camera``'s cruise extraction:
-# cruise is the fourth path segment from the end (``.../cruise/camera/ts/file``).
-# Anchored to end-of-string so it is independent of the mount-point prefix, in
-# lockstep with the Python parser (``test_cruise_expr_matches_parser``). Unlike
-# the parser this returns null on a non-matching path rather than raising —
-# safe here because ``aggregate_videos`` (always run first in the CLI) validates
-# every path via ``parse_cruise_camera`` before the frames stage is reached.
-_CRUISE_PATTERN = r"([^/]+)/[^/]+/[^/]+/[^/]+$"
+# cruise is the fourth path segment from the end (``.../cruise/camera/ts/file``),
+# or the fifth when an LRAUV ``basler-videos`` segment follows it. Anchored to
+# end-of-string so it is independent of the mount-point prefix; regex search is
+# leftmost, so on an LRAUV path the match starts at the cruise rather than at
+# ``basler-videos``. Kept in lockstep with the Python parser
+# (``test_cruise_expr_matches_parser``). Unlike the parser this returns null on
+# a non-matching path rather than raising — safe here because
+# ``aggregate_videos`` (always run first in the CLI) validates every path via
+# ``parse_cruise_camera`` before the frames stage is reached.
+_CRUISE_PATTERN = rf"([^/]+)/(?:{re.escape(_LRAUV_MARKER)}/)?[^/]+/[^/]+/[^/]+$"
+
+
+def _cruise_expr() -> pl.Expr:
+    """Cruise derived from ``media_path``, normalized like :func:`_normalize`."""
+    return (
+        pl.col("media_path")
+        .str.extract(_CRUISE_PATTERN, 1)
+        .str.replace_all(" ", "_", literal=True)
+    )
 
 
 def _frames_lazy(csv_paths: Iterable[str | Path]) -> pl.LazyFrame:
@@ -152,7 +221,7 @@ def _frames_lazy(csv_paths: Iterable[str | Path]) -> pl.LazyFrame:
     return (
         _scan_ok_frames(csv_paths)
         .with_columns(
-            pl.col("media_path").str.extract(_CRUISE_PATTERN, 1).alias("cruise"),
+            _cruise_expr().alias("cruise"),
             pl.col("media").alias("video_id"),
             pl.col("frame").cast(pl.Int64).alias("frame_index"),
             pl.col("times").str.to_datetime(strict=False, time_zone="UTC").alias("frame_time"),
@@ -208,17 +277,11 @@ def count_id_link_nonempty(csv_paths: Iterable[str | Path]) -> int:
     """How many rows have non-empty ``id`` or ``link``? Zero is the expected case.
 
     DESIGN.md says these columns are empty today; non-zero is a design-trigger
-    warning. Returns 0 if the columns are absent (older CSVs).
+    warning. CSVs without the columns contribute nulls (see ``_scan_one``).
     """
-    schema_names = _scan(csv_paths).collect_schema().names()
-    cond = None
-    for col in ("id", "link"):
-        if col not in schema_names:
-            continue
-        c = pl.col(col).is_not_null() & (pl.col(col).cast(pl.Utf8) != "")
-        cond = c if cond is None else (cond | c)
-    if cond is None:
-        return 0
+    cond = pl.any_horizontal(
+        pl.col(c).is_not_null() & (pl.col(c) != "") for c in ("id", "link")
+    )
     return int(_scan(csv_paths).filter(cond).select(pl.len()).collect(engine=_ENGINE).item())
 
 

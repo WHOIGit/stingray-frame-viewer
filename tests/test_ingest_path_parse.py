@@ -32,3 +32,20 @@ def test_relative_path_minimal():
 def test_too_short():
     with pytest.raises(ValueError, match="too short"):
         parse_cruise_camera("/proj/Stingray")
+
+
+LRAUV_PATH = (
+    "/mnt/sosiknas2/Lab_data/LRAUV/LRAUV LTER 20240212/basler-videos/pixys_isiis_camera/"
+    "2024-02-12-14-34-27.063/pixys_isiis_camera-001-2024-02-12-14-34-27.063.avi"
+)
+
+
+def test_lrauv_basler_videos_layout():
+    # LRAUV inserts basler-videos between cruise and camera; spaces in the
+    # cruise are normalized to underscores (partition-key safe).
+    assert parse_cruise_camera(LRAUV_PATH) == ("LRAUV_LTER_20240212", "pixys_isiis_camera")
+
+
+def test_lrauv_too_short():
+    with pytest.raises(ValueError, match="too short"):
+        parse_cruise_camera("basler-videos/cam/20240212/f.avi")
